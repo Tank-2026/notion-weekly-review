@@ -56,6 +56,23 @@ def g(p, k):
     return None
 
 
+# 「重要」优先级排序（数字越小越优先；未设置排最后）
+PRIORITY = {"战略顶级": 0, "重点关键": 1, "常规重要": 2, "临时任务": 3, "细微末节": 4}
+
+def tname(p):
+    return g(p, "任务名称") or "(无标题)"
+
+def prank(p):
+    return PRIORITY.get(g(p, "重要"), 9)
+
+def fmt_task(t):
+    p = t.get("properties", {})
+    imp = g(p, "重要"); due = g(p, "截止时间")
+    tag = f"[{imp}] " if imp else ""
+    du = f" · 截止{due}" if due else ""
+    return f"• {tag}{tname(p)}{du}"
+
+
 now = datetime.utcnow()
 today = now.strftime("%Y-%m-%d")
 week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d")
@@ -98,6 +115,17 @@ due_week = [t for t in work if (lambda p: g(p, "截止时间")
                                 and g(p, "状态") != "完成")(t.get("properties", {}))]
 n_due_week = len(due_week)
 
+# 按「重要」优先级排序，列出具体任务（避免只给数字看不到是哪些）
+overdue_sorted = sorted(overdue, key=lambda t: prank(t.get("properties", {})))[:8]
+due_sorted = sorted(due_week, key=lambda t: prank(t.get("properties", {})))[:8]
+# 本周重点关注：未完成(非完成/废弃)且填了「重要」的工作任务，按优先级取前 12
+focus = [t for t in work if g(t.get("properties", {}), "状态") not in ("完成", "废弃")
+         and g(t.get("properties", {}), "重要")]
+focus_sorted = sorted(focus, key=lambda t: prank(t.get("properties", {})))[:12]
+overdue_text = "\n".join(fmt_task(t) for t in overdue_sorted) or "（无）"
+due_text = "\n".join(fmt_task(t) for t in due_sorted) or "（无）"
+focus_text = "\n".join(fmt_task(t) for t in focus_sorted) or "（暂无标注「重要」的任务）"
+
 content = f"""【Workbuddy 自动生成 · 周度复盘 - {now.strftime('%Y-%m-%d')}】
 
 📊 任务结构（累计 · 工作领域；个人/其他已排除，未分类默认计为工作）
@@ -107,7 +135,13 @@ content = f"""【Workbuddy 自动生成 · 周度复盘 - {now.strftime('%Y-%m-%
 {"⚠️ 推进型<30%：本周偏简单重复，下周需把 KR 任务拉上来" if push_pct < 30 else "✓ 推进型占比健康"}
 
 🚨 真延期（工作·推进型·逾期未完成）：{n_overdue} 条  ← 本周重点清理对象
+{overdue_text}
+
 📅 本周到期未完成（工作）：{n_due_week} 条
+{due_text}
+
+⭐ 本周重点关注（按重要度排序 · 工作）
+{focus_text}
 
 🎯 需关注 KR（未开始/进行中）
 """ + "\n".join(kr_lines) + """
@@ -121,20 +155,26 @@ content = f"""【Workbuddy 自动生成 · 周度复盘 - {now.strftime('%Y-%m-%
 
 
 def write_to_page(text):
-    block = {
-        "type": "callout",
-        "callout": {
-            "rich_text": [{"type": "text", "text": {"content": text[:2000]}}],
-            "icon": {"type": "emoji", "emoji": "🤖"},
-        },
-    }
+    # Notion 单块富文本上限 2000 字，按行切分为多个 callout，保证整份复盘不丢内容
+    chunks, cur = [], ""
+    for ln in text.split("\n"):
+        if cur and len(cur) + len(ln) + 1 > 1900:
+            chunks.append(cur); cur = ln
+        else:
+            cur = (cur + "\n" + ln) if cur else ln
+    if cur:
+        chunks.append(cur)
+    children = [{"type": "callout", "callout": {
+        "rich_text": [{"type": "text", "text": {"content": c}}],
+        "icon": {"type": "emoji", "emoji": "🤖"}}}
+        for c in chunks]
     r = requests.patch(f"https://api.notion.com/v1/blocks/{PAGE_ID}/children",
-                       headers=H, json={"children": [block]}, timeout=20)
-    print("写入回顾纠偏页面:", r.status_code, r.json().get("message", "") if r.status_code != 200 else "OK")
+                       headers=H, json={"children": children}, timeout=20)
+    print("写入回顾纠偏页面:", r.status_code, r.json().get("message", "") if r.status_code != 200 else f"OK({len(children)}块)")
 
 
 if __name__ == "__main__":
-    print(f"[工作领域] KR需关注:{len(kr_lines)} | 累计完成:{total_done} | 推进型%:{push_pct} | 真延期:{n_overdue} | 本周到期:{n_due_week}")
+    print(f"[工作领域] KR需关注:{len(kr_lines)} | 累计完成:{total_done} | 推进型%:{push_pct} | 真延期:{n_overdue} | 本周到期:{n_due_week} | 重点关注:{len(focus)}")
     print("=" * 50)
     print(content)
     if WRITE:
