@@ -1,4 +1,4 @@
-import os, requests
+import os, requests, time
 from datetime import datetime, timedelta
 
 # ===== 从 GitHub Secrets 读取（本地测试用默认值） =====
@@ -17,10 +17,20 @@ def query(db_id, filter_body=None):
     if filter_body:
         body.update(filter_body)
     while True:
-        r = requests.post(url, headers=H, json=body, timeout=20)
-        d = r.json()
-        if r.status_code != 200:
-            print("查询失败:", d.get("message"))
+        d = None
+        for attempt in range(5):  # 网络抖动时重试，避免单次 TLS 中断导致整次复盘失败
+            try:
+                r = requests.post(url, headers=H, json=body, timeout=20)
+                d = r.json()
+                break
+            except Exception as e:
+                if attempt < 4:
+                    time.sleep(2 + attempt)
+                    continue
+                print("查询异常(已重试):", type(e).__name__, str(e)[:80])
+                return out
+        if d is None or r.status_code != 200:
+            print("查询失败:", (d or {}).get("message"))
             return out
         out += d.get("results", [])
         if not d.get("has_more"):
@@ -62,37 +72,42 @@ for r in krs:
     if st in ("未开始", "进行中"):
         kr_lines.append(f"• {name} | {st} | 信心:{conf} | 下一步:{act[:40]}")
 
-# 2. 任务统计
+# 2. 任务统计（只排除明确标了「个人/其他」的任务；未分类的历史任务默认视为工作，
+#    避免 2353 条历史任务因未填「领域」而全部归零。要更严格可改成 == "工作"）
+def is_work(p):
+    dom = g(p, "领域")
+    return dom in (None, "", "工作")
 tasks = query(TASK_DB)
-done = [t for t in tasks if g(t.get("properties", {}), "状态") == "完成"]
+work = [t for t in tasks if is_work(t.get("properties", {}))]
+done = [t for t in work if g(t.get("properties", {}), "状态") == "完成"]
 total_done = len(done)
 push = sum(1 for t in done if g(t.get("properties", {}), "项目管理数据库"))
 maintain = total_done - push
 push_pct = round(push * 100 / total_done) if total_done else 0
 
-# 真延期：推进型 + 有截止日期 + 截止<今天 + 未完成
-overdue = [t for t in tasks if (lambda p: g(p, "任务性质") == "推进型"
-                                and g(p, "状态") != "完成"
-                                and g(p, "截止时间")
-                                and g(p, "截止时间") < today)(t.get("properties", {}))]
+# 真延期：工作 + 推进型 + 有截止日期 + 截止<今天 + 未完成
+overdue = [t for t in work if (lambda p: g(p, "任务性质") == "推进型"
+                               and g(p, "状态") != "完成"
+                               and g(p, "截止时间")
+                               and g(p, "截止时间") < today)(t.get("properties", {}))]
 n_overdue = len(overdue)
 
-# 本周到期未完成（截止日期在近 7 天内）
-due_week = [t for t in tasks if (lambda p: g(p, "截止时间")
-                                 and week_ago <= g(p, "截止时间") <= today
-                                 and g(p, "状态") != "完成")(t.get("properties", {}))]
+# 本周到期未完成（工作领域，截止日期在近 7 天内）
+due_week = [t for t in work if (lambda p: g(p, "截止时间")
+                                and week_ago <= g(p, "截止时间") <= today
+                                and g(p, "状态") != "完成")(t.get("properties", {}))]
 n_due_week = len(due_week)
 
 content = f"""【Workbuddy 自动生成 · 周度复盘 - {now.strftime('%Y-%m-%d')}】
 
-📊 任务结构（累计）
-- 累计完成任务：{total_done} 条
+📊 任务结构（累计 · 工作领域；个人/其他已排除，未分类默认计为工作）
+- 累计完成（工作）：{total_done} 条
 - 推进型（挂项目）：{push} 条（{push_pct}%）
 - 维护型：{maintain} 条（{100 - push_pct}%）
 {"⚠️ 推进型<30%：本周偏简单重复，下周需把 KR 任务拉上来" if push_pct < 30 else "✓ 推进型占比健康"}
 
-🚨 真延期（推进型·逾期未完成）：{n_overdue} 条  ← 本周重点清理对象
-📅 本周到期未完成：{n_due_week} 条
+🚨 真延期（工作·推进型·逾期未完成）：{n_overdue} 条  ← 本周重点清理对象
+📅 本周到期未完成（工作）：{n_due_week} 条
 
 🎯 需关注 KR（未开始/进行中）
 """ + "\n".join(kr_lines) + """
@@ -119,7 +134,7 @@ def write_to_page(text):
 
 
 if __name__ == "__main__":
-    print(f"KR需关注:{len(kr_lines)} | 累计完成:{total_done} | 推进型%:{push_pct} | 真延期:{n_overdue} | 本周到期:{n_due_week}")
+    print(f"[工作领域] KR需关注:{len(kr_lines)} | 累计完成:{total_done} | 推进型%:{push_pct} | 真延期:{n_overdue} | 本周到期:{n_due_week}")
     print("=" * 50)
     print(content)
     if WRITE:
