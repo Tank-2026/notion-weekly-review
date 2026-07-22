@@ -1,21 +1,22 @@
 name: 每周复盘
+
 on:
-workflow_dispatch:
-schedule:
-- cron: "0 0 * * 6" # UTC周六0点 = 北京时间周六早8点
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * 6"  # UTC 周六 0 点 = 北京时间周六早 8 点
+
 jobs:
-review:
-runs-on: ubuntu-latest
-steps:
-- uses: actions/checkout@v4
-- uses: actions/setup-python@v5
-with:
-python-version: "3.11"
-- run: pip install requests
-- run: python review.py
-env:
-NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-NOTION_REVIEW_PAGE: ${{ secrets.NOTION_REVIEW_PAGE }}
-NOTION_KR_DB: ${{ secrets.NOTION_KR_DB }}
-NOTION_TASK_DB: ${{ secrets.NOTION_TASK_DB }}
-NOTION_PROJECT_DB: ${{ secrets.NOTION_PROJECT_DB }}
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests
+      - run: WRITE_TO_NOTION=1 python review.py
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_REVIEW_PAGE: ${{ secrets.NOTION_REVIEW_PAGE }}
+          NOTION_KR_DB: ${{ secrets.NOTION_KR_DB }}
+          NOTION_TASK_DB: ${{ secrets.NOTION_TASK_DB }}
