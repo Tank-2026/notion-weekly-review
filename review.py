@@ -1,11 +1,13 @@
 import os, requests
 from datetime import datetime, timedelta
 
+# ===== 从 GitHub Secrets 读取（本地测试用默认值） =====
 TOKEN = os.environ.get("NOTION_TOKEN", "ntn_U10348912549fc7XCmbmK2T8i6z41vEW2QsDYYcJG285tm")
 H = {"Authorization": f"Bearer {TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"}
 PAGE_ID = os.environ.get("NOTION_REVIEW_PAGE", "7445e6d5-15ca-4691-b34b-ca2db921909f")
 KR_DB = os.environ.get("NOTION_KR_DB", "e9056e7c-2110-4b09-badb-da80f2ec42ee")
 TASK_DB = os.environ.get("NOTION_TASK_DB", "31fa03dc-ff4a-47b1-8d27-ca3a749cb648")
+# 设 WRITE_TO_NOTION=1 才真正写入 Notion；本地测试默认只打印
 WRITE = os.environ.get("WRITE_TO_NOTION") == "1"
 
 
@@ -48,6 +50,7 @@ now = datetime.utcnow()
 today = now.strftime("%Y-%m-%d")
 week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d")
 
+# 1. KR 状态
 krs = query(KR_DB)
 kr_lines = []
 for r in krs:
@@ -59,6 +62,7 @@ for r in krs:
     if st in ("未开始", "进行中"):
         kr_lines.append(f"• {name} | {st} | 信心:{conf} | 下一步:{act[:40]}")
 
+# 2. 任务统计
 tasks = query(TASK_DB)
 done = [t for t in tasks if g(t.get("properties", {}), "状态") == "完成"]
 total_done = len(done)
@@ -66,12 +70,14 @@ push = sum(1 for t in done if g(t.get("properties", {}), "项目管理数据库"
 maintain = total_done - push
 push_pct = round(push * 100 / total_done) if total_done else 0
 
+# 真延期：推进型 + 有截止日期 + 截止<今天 + 未完成
 overdue = [t for t in tasks if (lambda p: g(p, "任务性质") == "推进型"
                                 and g(p, "状态") != "完成"
                                 and g(p, "截止时间")
                                 and g(p, "截止时间") < today)(t.get("properties", {}))]
 n_overdue = len(overdue)
 
+# 本周到期未完成（截止日期在近 7 天内）
 due_week = [t for t in tasks if (lambda p: g(p, "截止时间")
                                  and week_ago <= g(p, "截止时间") <= today
                                  and g(p, "状态") != "完成")(t.get("properties", {}))]
