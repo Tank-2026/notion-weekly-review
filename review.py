@@ -7,6 +7,17 @@ H = {"Authorization": f"Bearer {TOKEN}", "Notion-Version": "2022-06-28", "Conten
 PAGE_ID = os.environ.get("NOTION_REVIEW_PAGE", "7445e6d5-15ca-4691-b34b-ca2db921909f")
 KR_DB = os.environ.get("NOTION_KR_DB", "e9056e7c-2110-4b09-badb-da80f2ec42ee")
 TASK_DB = os.environ.get("NOTION_TASK_DB", "31fa03dc-ff4a-47b1-8d27-ca3a749cb648")
+# 「复盘记录数据库」：原沉在回顾纠偏底部的「周度复盘」库，已挪到主页并重命名。
+# 每次复盘在此库写入/更新一行结构化记录（按「周次」upsert，避免重复）。
+SUMMARY_DB = os.environ.get("NOTION_SUMMARY_DB", "3a603daf-2ff6-81dc-ad40-e4e9ab85f938")
+# 该目标关联的项目（用于「关联项目」列；取自目标库下 KR 的关联项目）
+GOAL_PROJECTS = [
+    "2c303daf-2ff6-808b-b81d-d6c39aa3afdb",  # 2025POA汇报幻灯
+    "28903daf-2ff6-8081-92e8-de2e64a36b29",  # 熟悉茁乐瑞普多
+    "3c883c49-f267-4ab8-82e5-6fdcb6ff6ed4",  # 中青年覆盖
+    "2b203daf-2ff6-809b-9ac1-e2a8689a72f6",  # 客情跟进
+]
+GOAL_NAME = "2026年完成率120%"
 # 设 WRITE_TO_NOTION=1 才真正写入 Notion；本地测试默认只打印
 WRITE = os.environ.get("WRITE_TO_NOTION") == "1"
 
@@ -76,6 +87,8 @@ def fmt_task(t):
 now = datetime.utcnow()
 today = now.strftime("%Y-%m-%d")
 week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+y, w, _ = now.isocalendar()
+week = f"{y}-W{w:02d}"  # 例：2026-W30
 
 # 1. KR 状态
 krs = query(KR_DB)
@@ -173,12 +186,59 @@ def write_to_page(text):
     print("写入回顾纠偏页面:", r.status_code, r.json().get("message", "") if r.status_code != 200 else f"OK({len(children)}块)")
 
 
+def health_status(push_pct):
+    """推进型占比 → 健康度 select。"""
+    if push_pct < 30:
+        return "风险"
+    if push_pct < 50:
+        return "警告"
+    return "健康"
+
+
+def build_summary_props():
+    """构造「复盘记录数据库」一行所需的 properties。"""
+    props = {
+        "周次": {"title": [{"text": {"content": week}}]},
+        "复盘日期": {"date": {"start": today}},
+        "累计完成工作": {"number": total_done},
+        "推进型占比": {"number": push_pct},
+        "真延期数": {"number": n_overdue},
+        "本周到期数": {"number": n_due_week},
+        "健康度": {"select": {"name": health_status(push_pct)}},
+        "关联目标": {"rich_text": [{"text": {"content": GOAL_NAME}}]},
+        "关联项目": {"relation": [{"id": pid} for pid in GOAL_PROJECTS]},
+    }
+    return props
+
+
+def write_summary_row():
+    """向「复盘记录数据库」写入/更新一行：按「周次」upsert，避免同周重复。"""
+    props = build_summary_props()
+    # 查询本周是否已有记录
+    existing = query(SUMMARY_DB, {"filter": {"property": "周次", "title": {"equals": week}}})
+    if existing:
+        pid = existing[0]["id"]
+        r = requests.request("PATCH", f"https://api.notion.com/v1/pages/{pid}",
+                             headers=H, json={"properties": props}, timeout=20)
+        print(f"复盘记录数据库[更新 {week}]:", r.status_code,
+              r.json().get("message", "") if r.status_code != 200 else f"OK({pid})")
+        return r.status_code
+    body = {"parent": {"database_id": SUMMARY_DB}, "properties": props}
+    r = requests.request("POST", "https://api.notion.com/v1/pages",
+                         headers=H, json=body, timeout=20)
+    print(f"复盘记录数据库[新建 {week}]:", r.status_code,
+          r.json().get("message", "") if r.status_code != 200 else f"OK({r.json().get('id')})")
+    return r.status_code
+
+
 if __name__ == "__main__":
-    print(f"[工作领域] KR需关注:{len(kr_lines)} | 累计完成:{total_done} | 推进型%:{push_pct} | 真延期:{n_overdue} | 本周到期:{n_due_week} | 重点关注:{len(focus)}")
+    print(f"[工作领域] 周次:{week} | KR需关注:{len(kr_lines)} | 累计完成:{total_done} | 推进型%:{push_pct} | 真延期:{n_overdue} | 本周到期:{n_due_week} | 重点关注:{len(focus)} | 健康度:{health_status(push_pct)}")
     print("=" * 50)
     print(content)
     if WRITE:
         write_to_page(content)
+        write_summary_row()
     else:
         print("=" * 50)
         print("【本地干跑，未写入 Notion。GitHub Actions 运行时会自动写入】")
+        print("复盘记录数据库待写入行:", week, "|", build_summary_props())
