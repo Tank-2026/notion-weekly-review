@@ -1,4 +1,4 @@
-import os, requests, time
+import os, sys, requests, time
 from datetime import datetime, timedelta
 
 # ===== 从 GitHub Secrets 读取（本地测试用默认值） =====
@@ -7,19 +7,23 @@ H = {"Authorization": f"Bearer {TOKEN}", "Notion-Version": "2022-06-28", "Conten
 PAGE_ID = os.environ.get("NOTION_REVIEW_PAGE", "7445e6d5-15ca-4691-b34b-ca2db921909f")
 KR_DB = os.environ.get("NOTION_KR_DB", "e9056e7c-2110-4b09-badb-da80f2ec42ee")
 TASK_DB = os.environ.get("NOTION_TASK_DB", "31fa03dc-ff4a-47b1-8d27-ca3a749cb648")
-# 「复盘记录数据库」：原沉在回顾纠偏底部的「周度复盘」库，已挪到主页并重命名。
-# 每次复盘在此库写入/更新一行结构化记录（按「周次」upsert，避免重复）。
+# 「复盘记录数据库」：每次复盘在此库写入/更新一行结构化记录（按「周次」upsert，避免重复）。
 SUMMARY_DB = os.environ.get("NOTION_SUMMARY_DB", "3a603daf-2ff6-81dc-ad40-e4e9ab85f938")
-# 该目标关联的项目（用于「关联项目」列；取自目标库下 KR 的关联项目）
+# 该目标关联的项目（用于「关联项目」列）。写入前会校验，已删除的会自动剔除，不影响整行写入。
 GOAL_PROJECTS = [
-    "2c303daf-2ff6-808b-b81d-d6c39aa3afdb",  # 2025POA汇报幻灯
+    "2c303daf-2ff6-808b-b81d-d6c39aa3afdb",  # 2025POA汇报幻灯（已删除，会被自动剔除）
     "28903daf-2ff6-8081-92e8-de2e64a36b29",  # 熟悉茁乐瑞普多
     "3c883c49-f267-4ab8-82e5-6fdcb6ff6ed4",  # 中青年覆盖
     "2b203daf-2ff6-809b-9ac1-e2a8689a72f6",  # 客情跟进
 ]
 GOAL_NAME = "2026年完成率120%"
+# 每周复盘页上两个承诺小节的标题（用于抓取文本入库）
+SEC_LAST = "回顾上周承诺"
+SEC_NEXT = "确定下周承诺"
 # 设 WRITE_TO_NOTION=1 才真正写入 Notion；本地测试默认只打印
 WRITE = os.environ.get("WRITE_TO_NOTION") == "1"
+# --sync：承诺回写模式（只更新承诺字段，不重新生成/覆盖指标）
+SYNC = "--sync" in sys.argv
 
 
 def query(db_id, filter_body=None):
@@ -65,6 +69,59 @@ def g(p, k):
     if t == "relation":
         return v.get("relation") or []
     return None
+
+
+# ===== 通用：读取页面块 / 抓取折叠小节文本 =====
+def page_children(bid):
+    """读取某块的子块；带重试，失败返回空列表（不中断主流程）。"""
+    url = f"https://api.notion.com/v1/blocks/{bid}/children?page_size=100"
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=H, timeout=20)
+            if r.status_code == 200:
+                return r.json().get("results", [])
+        except Exception:
+            time.sleep(2)
+    return []
+
+
+def block_text(b):
+    """提取一个块的纯文本，覆盖页面上出现过的所有文本块类型。"""
+    t = b.get("type")
+    for k in ("paragraph", "heading_1", "heading_2", "heading_3", "callout", "toggle",
+              "bulleted_list_item", "numbered_list_item", "to_do", "quote"):
+        if t == k:
+            return "".join(x.get("plain_text", "") for x in b.get(k, {}).get("rich_text", []))
+    return ""
+
+
+def read_section(page_id, title):
+    """在页面中定位指定标题块（折叠小节），返回其子块文本拼接。
+    支持：paragraph（回顾上周承诺用它）与 numbered_list_item（确定下周承诺用它）。"""
+    for b in page_children(page_id):
+        t = b.get("type")
+        if t in ("heading_1", "heading_2", "heading_3", "toggle"):
+            name = "".join(x.get("plain_text", "") for x in b.get(t, {}).get("rich_text", []))
+            if title in name and b.get("has_children"):
+                lines = []
+                for c in page_children(b["id"]):
+                    s = block_text(c).strip()
+                    if s:
+                        lines.append(s)
+                    # 二级内容（toggle 内嵌套）
+                    if c.get("has_children") and c.get("type") in ("toggle", "bulleted_list_item", "numbered_list_item"):
+                        for c2 in page_children(c["id"]):
+                            s2 = block_text(c2).strip()
+                            if s2:
+                                lines.append("  - " + s2)
+                return "\n".join(lines)
+    return ""
+
+
+def trim(s, limit=1900):
+    """Notion 单条 rich_text 上限 2000 字，超限时截断并提示。"""
+    s = (s or "").strip()
+    return s if len(s) <= limit else s[:limit] + "…（完整正文见本行页面内）"
 
 
 # 「重要」优先级排序（数字越小越优先；未设置排最后）
@@ -169,6 +226,15 @@ content = f"""【Workbuddy 自动生成 · 周度复盘 - {now.strftime('%Y-%m-%
 
 def write_to_page(text):
     # Notion 单块富文本上限 2000 字，按行切分为多个 callout，保证整份复盘不丢内容
+    children = _text_to_callouts(text, "🤖")
+    r = requests.patch(f"https://api.notion.com/v1/blocks/{PAGE_ID}/children",
+                       headers=H, json={"children": children}, timeout=20)
+    print("写入回顾纠偏页面:", r.status_code,
+          r.json().get("message", "") if r.status_code != 200 else f"OK({len(children)}块)")
+
+
+def _text_to_callouts(text, icon, prefix=""):
+    """把长文本按 1900 字切块，转成 callout 块列表。"""
     chunks, cur = [], ""
     for ln in text.split("\n"):
         if cur and len(cur) + len(ln) + 1 > 1900:
@@ -177,13 +243,10 @@ def write_to_page(text):
             cur = (cur + "\n" + ln) if cur else ln
     if cur:
         chunks.append(cur)
-    children = [{"type": "callout", "callout": {
-        "rich_text": [{"type": "text", "text": {"content": c}}],
-        "icon": {"type": "emoji", "emoji": "🤖"}}}
-        for c in chunks]
-    r = requests.patch(f"https://api.notion.com/v1/blocks/{PAGE_ID}/children",
-                       headers=H, json={"children": children}, timeout=20)
-    print("写入回顾纠偏页面:", r.status_code, r.json().get("message", "") if r.status_code != 200 else f"OK({len(children)}块)")
+    return [{"type": "callout", "callout": {
+        "rich_text": [{"type": "text", "text": {"content": (prefix + c if i == 0 else c)}}],
+        "icon": {"type": "emoji", "emoji": icon}}}
+        for i, c in enumerate(chunks)]
 
 
 def health_status(push_pct):
@@ -195,9 +258,34 @@ def health_status(push_pct):
     return "健康"
 
 
+# ===== 关联项目：校验并剔除已删除的死链 =====
+_PROJ_CACHE = {}
+
+def valid_project_ids(ids):
+    """过滤已删除/无权限的项目页，避免 relation 死链导致整行写入失败。"""
+    ok = []
+    for pid in ids:
+        if pid in _PROJ_CACHE:
+            if _PROJ_CACHE[pid]:
+                ok.append(pid)
+            continue
+        good = False
+        try:
+            r = requests.get(f"https://api.notion.com/v1/pages/{pid}", headers=H, timeout=15)
+            good = (r.status_code == 200) and (not r.json().get("archived"))
+        except Exception:
+            good = False
+        _PROJ_CACHE[pid] = good
+        if good:
+            ok.append(pid)
+        else:
+            print(f"  ⚠ 关联项目已失效，已剔除: {pid}")
+    return ok
+
+
 def build_summary_props():
-    """构造「复盘记录数据库」一行所需的 properties。"""
-    props = {
+    """构造「复盘记录数据库」一行所需的 properties（指标部分）。"""
+    return {
         "周次": {"title": [{"text": {"content": week}}]},
         "复盘日期": {"date": {"start": today}},
         "累计完成工作": {"number": total_done},
@@ -206,39 +294,122 @@ def build_summary_props():
         "本周到期数": {"number": n_due_week},
         "健康度": {"select": {"name": health_status(push_pct)}},
         "关联目标": {"rich_text": [{"text": {"content": GOAL_NAME}}]},
-        "关联项目": {"relation": [{"id": pid} for pid in GOAL_PROJECTS]},
+        "关联项目": {"relation": [{"id": pid} for pid in valid_project_ids(GOAL_PROJECTS)]},
     }
-    return props
 
 
-def write_summary_row():
-    """向「复盘记录数据库」写入/更新一行：按「周次」upsert，避免同周重复。"""
-    props = build_summary_props()
-    # 查询本周是否已有记录
+def commit_props():
+    """从回顾纠偏页面抓取两个承诺小节的文本。"""
+    return {
+        "上周承诺回顾": {"rich_text": [{"text": {"content": trim(read_section(PAGE_ID, SEC_LAST))}}]},
+        "下周承诺三件事": {"rich_text": [{"text": {"content": trim(read_section(PAGE_ID, SEC_NEXT))}}]},
+    }
+
+
+def auto_summary_prop():
+    return {"自动复盘摘要": {"rich_text": [{"text": {"content": trim(content, 1500)}}]}}
+
+
+def write_row_body(page_id, text):
+    """把完整自动正文写进该行页面正文（不受 2000 字属性上限限制）。
+    幂等：先删除本行已有的自动正文块，再重新写入。"""
+    for b in page_children(page_id):
+        if b.get("type") == "callout" and block_text(b).startswith("【Workbuddy 自动正文"):
+            try:
+                requests.delete(f"https://api.notion.com/v1/blocks/{b['id']}", headers=H, timeout=15)
+            except Exception:
+                pass
+    children = _text_to_callouts(text, "📄", prefix=f"【Workbuddy 自动正文 · {week}】\n\n")
+    r = requests.patch(f"https://api.notion.com/v1/blocks/{page_id}/children",
+                       headers=H, json={"children": children}, timeout=20)
+    print("行内自动正文:", r.status_code,
+          r.json().get("message", "") if r.status_code != 200 else f"OK({len(children)}块)")
+
+
+def _upsert(props):
+    """按「周次」upsert，返回 (response, row_page_id)。"""
     existing = query(SUMMARY_DB, {"filter": {"property": "周次", "title": {"equals": week}}})
     if existing:
         pid = existing[0]["id"]
         r = requests.request("PATCH", f"https://api.notion.com/v1/pages/{pid}",
                              headers=H, json={"properties": props}, timeout=20)
-        print(f"复盘记录数据库[更新 {week}]:", r.status_code,
-              r.json().get("message", "") if r.status_code != 200 else f"OK({pid})")
-        return r.status_code
+        return r, pid
     body = {"parent": {"database_id": SUMMARY_DB}, "properties": props}
     r = requests.request("POST", "https://api.notion.com/v1/pages",
                          headers=H, json=body, timeout=20)
-    print(f"复盘记录数据库[新建 {week}]:", r.status_code,
-          r.json().get("message", "") if r.status_code != 200 else f"OK({r.json().get('id')})")
+    return r, (r.json().get("id") if r.status_code == 200 else None)
+
+
+def write_summary_row():
+    """向「复盘记录数据库」写入/更新一行：指标 + 承诺 + 摘要 + 行内正文。"""
+    props = build_summary_props()
+    props.update(commit_props())
+    props.update(auto_summary_prop())
+    r, pid = _upsert(props)
+    if r.status_code != 200:
+        # 关联关系异常时，去掉「关联项目」重试一次，保证这一行不会因为关联问题整行丢失
+        print("  ⚠ 首次写入失败，去掉「关联项目」重试:", str(r.json().get("message", ""))[:120])
+        props.pop("关联项目", None)
+        r, pid = _upsert(props)
+    print(f"复盘记录数据库[{'更新' if pid else '新建'} {week}]:", r.status_code,
+          r.json().get("message", "") if r.status_code != 200 else f"OK({pid})")
+    if r.status_code == 200 and pid:
+        write_row_body(pid, content)  # 完整正文写进页面，便于留存与回溯
+    return r.status_code
+
+
+def find_latest_row():
+    """返回「复盘日期」最新的一行（用于周一回写承诺）。"""
+    rows = query(SUMMARY_DB)
+    if not rows:
+        return None
+    def d(r):
+        v = r.get("properties", {}).get("复盘日期", {}).get("date")
+        return (v or {}).get("start", "")
+    return sorted(rows, key=d, reverse=True)[0]
+
+
+def sync_commitments():
+    """--sync：把页面上现在写的两个承诺小节，回写到最近一条复盘记录。
+    只更新承诺字段，不覆盖周六生成的指标与摘要。"""
+    row = find_latest_row()
+    if not row:
+        print("未找到任何复盘记录，跳过回写")
+        return None
+    pid = row["id"]
+    wk = "".join(x.get("plain_text", "")
+                 for x in row.get("properties", {}).get("周次", {}).get("title", []))
+    props = commit_props()
+    r = requests.request("PATCH", f"https://api.notion.com/v1/pages/{pid}",
+                         headers=H, json={"properties": props}, timeout=20)
+    last = props["上周承诺回顾"]["rich_text"][0]["text"]["content"]
+    nxt = props["下周承诺三件事"]["rich_text"][0]["text"]["content"]
+    print(f"承诺回写[{wk}]:", r.status_code,
+          r.json().get("message", "") if r.status_code != 200 else "OK")
+    print(f"  上周承诺回顾: {len(last)} 字 | 下周承诺三件事: {len(nxt)} 字")
+    if not last and not nxt:
+        print("  ⚠ 两个小节都没读到内容，请检查页面上是否已填写、或小节标题是否变动")
     return r.status_code
 
 
 if __name__ == "__main__":
-    print(f"[工作领域] 周次:{week} | KR需关注:{len(kr_lines)} | 累计完成:{total_done} | 推进型%:{push_pct} | 真延期:{n_overdue} | 本周到期:{n_due_week} | 重点关注:{len(focus)} | 健康度:{health_status(push_pct)}")
+    print(f"[工作领域] 周次:{week} | KR需关注:{len(kr_lines)} | 累计完成:{total_done} | "
+          f"推进型%:{push_pct} | 真延期:{n_overdue} | 本周到期:{n_due_week} | "
+          f"重点关注:{len(focus)} | 健康度:{health_status(push_pct)}")
     print("=" * 50)
     print(content)
-    if WRITE:
+    print("=" * 50)
+    if SYNC:
+        print("【承诺回写模式 --sync】")
+        if WRITE:
+            sync_commitments()
+        else:
+            print("【本地干跑，未写入 Notion】")
+            print("将回写:", commit_props())
+    elif WRITE:
         write_to_page(content)
         write_summary_row()
     else:
-        print("=" * 50)
         print("【本地干跑，未写入 Notion。GitHub Actions 运行时会自动写入】")
-        print("复盘记录数据库待写入行:", week, "|", build_summary_props())
+        props = build_summary_props(); props.update(commit_props()); props.update(auto_summary_prop())
+        print("复盘记录数据库待写入行:", week, "|", props)
