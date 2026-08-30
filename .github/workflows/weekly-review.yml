@@ -1,22 +1,58 @@
-name: 每周复盘
+name: Weekly Review
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "0 0 * * 6"  # UTC 周六 0 点 = 北京时间周六早 8 点
+    # 每周六 00:00 UTC = 北京时间周六 08:00
+    #   → 生成周度复盘正文（写回顾纠偏页面）+ 写入复盘记录数据库（指标+承诺+摘要+行内正文）
+    - cron: '0 0 * * 6'
+    # 每周一 00:00 UTC = 北京时间周一 08:00
+    #   → 承诺回写（--sync）：重读页面上的「回顾上周承诺」「确定下周承诺（三件事）」，
+    #     更新最近一条记录，把周末写的承诺补进数据库
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '运行模式（full=完整生成；sync=仅回写承诺）'
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - sync
 
 jobs:
   review:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - run: pip install requests
-      - run: WRITE_TO_NOTION=1 python review.py
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Determine run mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "arg=${{ github.event.inputs.mode }}" >> $GITHUB_OUTPUT
+          elif [ "$(date -u +%u)" = "1" ]; then
+            # 周一 → 承诺回写
+            echo "arg=sync" >> $GITHUB_OUTPUT
+          else
+            echo "arg=full" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run weekly review
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          NOTION_REVIEW_PAGE: ${{ secrets.NOTION_REVIEW_PAGE }}
-          NOTION_KR_DB: ${{ secrets.NOTION_KR_DB }}
-          NOTION_TASK_DB: ${{ secrets.NOTION_TASK_DB }}
+          WRITE_TO_NOTION: '1'
+        run: |
+          echo "运行模式: ${{ steps.mode.outputs.arg }}"
+          if [ "${{ steps.mode.outputs.arg }}" = "sync" ]; then
+            python review.py --sync
+          else
+            python review.py
+          fi
