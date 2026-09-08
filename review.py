@@ -378,7 +378,7 @@ def build_summary_props():
     return {
         "周次": {"title": [{"text": {"content": week}}]},
         "复盘日期": {"date": {"start": today}},
-        "近4周兑现率": {"number": r4},
+        "近4周兑现率": {"number": r4 / 100},  # percent 字段：值是 0~1（Notion 显示为百分比）
         "近4周完成数": {"number": len(w4_ok)},
         "本周完成数": {"number": len(wk_ok)},
         "活跃待办数": {"number": n_active},
@@ -395,10 +395,6 @@ def commit_props():
         "上周承诺回顾": {"rich_text": [{"text": {"content": trim(read_section(PAGE_ID, SEC_LAST))}}]},
         "下周承诺三件事": {"rich_text": [{"text": {"content": trim(read_section(PAGE_ID, SEC_NEXT))}}]},
     }
-
-
-def auto_summary_prop():
-    return {"自动复盘摘要": {"rich_text": [{"text": {"content": trim(content, 1500)}}]}}
 
 
 def write_row_body(page_id, text):
@@ -418,34 +414,35 @@ def write_row_body(page_id, text):
 
 
 def _upsert(props):
-    """按「周次」upsert，返回 (response, row_page_id)。"""
+    """按「周次」upsert，返回 (response, row_page_id, was_update)。was_update=True 表示更新已有行，False 表示新建。"""
     existing = query(SUMMARY_DB, {"filter": {"property": "周次", "title": {"equals": week}}})
     if existing:
         pid = existing[0]["id"]
         r = requests.request("PATCH", f"https://api.notion.com/v1/pages/{pid}",
                              headers=H, json={"properties": props}, timeout=20)
-        return r, pid
+        return r, pid, True
     body = {"parent": {"database_id": SUMMARY_DB}, "properties": props}
     r = requests.request("POST", "https://api.notion.com/v1/pages",
                          headers=H, json=body, timeout=20)
-    return r, (r.json().get("id") if r.status_code == 200 else None)
+    return r, (r.json().get("id") if r.status_code == 200 else None), False
 
 
 def write_summary_row():
-    """向「复盘记录数据库」写入/更新一行：指标 + 承诺 + 摘要 + 行内正文。"""
+    """向「复盘记录数据库」写入/更新一行：指标 + 承诺 + 行内正文。
+    「自动复盘摘要」字段已删除（与页面正文重复），不在这里写入。"""
     props = build_summary_props()
     props.update(commit_props())
-    props.update(auto_summary_prop())
-    r, pid = _upsert(props)
+    r, pid, was_update = _upsert(props)
     if r.status_code != 200:
         # 关联关系异常时，去掉「关联项目」重试一次，保证这一行不会因为关联问题整行丢失
         print("  ⚠ 首次写入失败，去掉「关联项目」重试:", str(r.json().get("message", ""))[:120])
         props.pop("关联项目", None)
-        r, pid = _upsert(props)
-    print(f"复盘记录数据库[{'更新' if pid else '新建'} {week}]:", r.status_code,
+        r, pid, was_update = _upsert(props)
+    action = "更新" if was_update else "新建"
+    print(f"复盘记录数据库[{action} {week}]:", r.status_code,
           r.json().get("message", "") if r.status_code != 200 else f"OK({pid})")
     if r.status_code == 200 and pid:
-        write_row_body(pid, content)  # 完整正文写进页面，便于留存与回溯
+        write_row_body(pid, content)  # 完整正文写进页面（callout 块），便于留存与回溯
     return r.status_code
 
 
@@ -503,5 +500,5 @@ if __name__ == "__main__":
         write_summary_row()
     else:
         print("【本地干跑，未写入 Notion。GitHub Actions 运行时会自动写入】")
-        props = build_summary_props(); props.update(commit_props()); props.update(auto_summary_prop())
+        props = build_summary_props(); props.update(commit_props())
         print("复盘记录数据库待写入行:", week, "|", props)
