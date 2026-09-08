@@ -143,7 +143,6 @@ def fmt_task(t):
 
 now = datetime.utcnow()
 today = now.strftime("%Y-%m-%d")
-week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d")
 y, w, _ = now.isocalendar()
 week = f"{y}-W{w:02d}"  # 例：2026-W30
 
@@ -159,58 +158,114 @@ for r in krs:
     if st in ("未开始", "进行中"):
         kr_lines.append(f"• {name} | {st} | 信心:{conf} | 下一步:{act[:40]}")
 
-# 2. 任务统计（只排除明确标了「个人/其他」的任务；未分类的历史任务默认视为工作，
-#    避免 2353 条历史任务因未填「领域」而全部归零。要更严格可改成 == "工作"）
+# ===== 2. 任务统计 —— 滚动窗口口径 =====
+# 口径（已确认）：
+#   分子 = 窗口内「截止时间」且 状态=完成 的任务数
+#   分母 = 窗口内「截止时间」且 状态≠废弃 的任务数（含未完成）
+#   依据：完成任务后会把「截止时间」改成完成当天，所以已完成任务的截止时间即完成日，
+#         可直接用来归周；未完成任务的截止时间仍是原计划截止日。
+#   副产物：拖期完成的任务会随截止时间一起挪到完成那周，因此历史周数字是滚动快照，
+#         会随补录而变化（已确认接受）。
 def is_work(p):
     dom = g(p, "领域")
     return dom in (None, "", "工作")
+
 tasks = query(TASK_DB)
 work = [t for t in tasks if is_work(t.get("properties", {}))]
-done = [t for t in work if g(t.get("properties", {}), "状态") == "完成"]
-total_done = len(done)
-push = sum(1 for t in done if g(t.get("properties", {}), "项目管理数据库"))
-maintain = total_done - push
-push_pct = round(push * 100 / total_done) if total_done else 0
 
-# 真延期：工作 + 推进型 + 有截止日期 + 截止<今天 + 未完成
-overdue = [t for t in work if (lambda p: g(p, "任务性质") == "推进型"
-                               and g(p, "状态") != "完成"
-                               and g(p, "截止时间")
-                               and g(p, "截止时间") < today)(t.get("properties", {}))]
-n_overdue = len(overdue)
+DONE_ST, DROP_ST = "完成", "废弃"
+ACTIVE_ST = ("待办", "日程", "等待")  # 真正欠账的状态；「将来也许/未整理」属停放区，不计
 
-# 本周到期未完成（工作领域，截止日期在近 7 天内）
-due_week = [t for t in work if (lambda p: g(p, "截止时间")
-                                and week_ago <= g(p, "截止时间") <= today
-                                and g(p, "状态") != "完成")(t.get("properties", {}))]
-n_due_week = len(due_week)
+def window(a, b):
+    """截止时间落在 [a,b] 的任务 → (分母, 已完成, 未完成)。「废弃」不计入分母。"""
+    tot, ok, miss = [], [], []
+    for t in work:
+        p = t.get("properties", {})
+        due = g(p, "截止时间")
+        if not (due and a <= due <= b):
+            continue
+        st = g(p, "状态")
+        if st == DROP_ST:
+            continue
+        tot.append(t)
+        (ok if st == DONE_ST else miss).append(t)
+    return tot, ok, miss
 
-# 按「重要」优先级排序，列出具体任务（避免只给数字看不到是哪些）
-overdue_sorted = sorted(overdue, key=lambda t: prank(t.get("properties", {})))[:8]
-due_sorted = sorted(due_week, key=lambda t: prank(t.get("properties", {})))[:8]
-# 本周重点关注：未完成(非完成/废弃)且填了「重要」的工作任务，按优先级取前 12
-focus = [t for t in work if g(t.get("properties", {}), "状态") not in ("完成", "废弃")
+# 本周（周一~周日，自然周）
+_mon = now - timedelta(days=now.weekday())
+this_a = _mon.strftime("%Y-%m-%d")
+this_b = (_mon + timedelta(days=6)).strftime("%Y-%m-%d")
+# 近 4 周（滚动 28 天，含今天）与前 4 周（趋势基线）
+w4_a = (now - timedelta(days=27)).strftime("%Y-%m-%d")
+w4_b = today
+p4_a = (now - timedelta(days=55)).strftime("%Y-%m-%d")
+p4_b = (now - timedelta(days=28)).strftime("%Y-%m-%d")
+
+w4_tot, w4_ok, w4_miss = window(w4_a, w4_b)
+p4_tot, p4_ok, _ = window(p4_a, p4_b)
+wk_tot, wk_ok, _ = window(this_a, this_b)
+
+def rate(ok, tot):
+    return round(len(ok) * 100 / len(tot)) if tot else 0
+
+r4 = rate(w4_ok, w4_tot)
+r4_prev = rate(p4_ok, p4_tot)
+delta = r4 - r4_prev
+
+# 推进型结构：近 4 周「已完成」中挂了项目的比例（不再用累计口径）
+push = sum(1 for t in w4_ok if g(t.get("properties", {}), "项目管理数据库"))
+maintain = len(w4_ok) - push
+push_pct = round(push * 100 / len(w4_ok)) if w4_ok else 0
+
+# 时点：活跃待办（排除已废弃与停放区，反映真实欠账）
+active_todo = [t for t in work if g(t.get("properties", {}), "状态") in ACTIVE_ST]
+n_active = len(active_todo)
+
+# 清单（只列事实与任务名，不做拖沓/延期判断，由本人看页面时自行评估）
+miss_sorted = sorted(w4_miss, key=lambda t: prank(t.get("properties", {})))[:8]
+focus = [t for t in work if g(t.get("properties", {}), "状态") not in (DONE_ST, DROP_ST)
          and g(t.get("properties", {}), "重要")]
 focus_sorted = sorted(focus, key=lambda t: prank(t.get("properties", {})))[:12]
-overdue_text = "\n".join(fmt_task(t) for t in overdue_sorted) or "（无）"
-due_text = "\n".join(fmt_task(t) for t in due_sorted) or "（无）"
+miss_text = "\n".join(fmt_task(t) for t in miss_sorted) or "（无，近4周内到期任务均已完成）"
 focus_text = "\n".join(fmt_task(t) for t in focus_sorted) or "（暂无标注「重要」的任务）"
+
+# 兑现率 → 一句诊断（阈值与 health_status 保持一致）
+if r4 >= 85:
+    health_note = "✓ 兑现率健康，可考虑把下周承诺加码一件"
+elif r4 >= 70:
+    health_note = "⚠️ 兑现率偏低：先看下方清单，是估多了还是卡住了"
+else:
+    health_note = "🚨 兑现率告急：近4周四成以上到期任务没落地，建议下周只承诺 2 件事"
+
+# 本周样本太小时不给百分比，避免 3/3 被读成"完美"
+if len(wk_tot) < 5:
+    week_note = f"- 样本仅 {len(wk_tot)} 件，不给百分比，只看方向"
+elif len(wk_tot) == len(wk_ok):
+    week_note = f"- 兑现率 {rate(wk_ok, wk_tot)}%（本周已全部落地）"
+else:
+    week_note = f"- 兑现率 {rate(wk_ok, wk_tot)}%（周尚未结束，还会变化）"
+
+trend = ("↑" if delta > 0 else "↓" if delta < 0 else "—") + f" {abs(delta)}pt"
 
 content = f"""【Workbuddy 自动生成 · 周度复盘 - {now.strftime('%Y-%m-%d')}】
 
-📊 任务结构（累计 · 工作领域；个人/其他已排除，未分类默认计为工作）
-- 累计完成（工作）：{total_done} 条
-- 推进型（挂项目）：{push} 条（{push_pct}%）
-- 维护型：{maintain} 条（{100 - push_pct}%）
-{"⚠️ 推进型<30%：本周偏简单重复，下周需把 KR 任务拉上来" if push_pct < 30 else "✓ 推进型占比健康"}
+🎯 近 4 周兑现率（主口径 · {w4_a} ~ {w4_b}）
+- 到期 {len(w4_tot)} 件 / 完成 {len(w4_ok)} 件 → {r4}%
+- 前 4 周 {r4_prev}% → {trend}
+- 推进型（挂项目）{push} 件，占完成量 {push_pct}%
+{health_note}
 
-🚨 真延期（工作·推进型·逾期未完成）：{n_overdue} 条  ← 本周重点清理对象
-{overdue_text}
+📅 本周（{this_a} ~ {this_b}，截至今天，周未结束）
+- 到期 {len(wk_tot)} 件 / 完成 {len(wk_ok)} 件
+{week_note}
 
-📅 本周到期未完成（工作）：{n_due_week} 条
-{due_text}
+📌 当前活跃待办：{n_active} 件
+（只算 待办/日程/等待；已排除「废弃」与停放区「将来也许/未整理」）
 
-⭐ 本周重点关注（按重要度排序 · 工作）
+📋 近 4 周内到期 · 尚未完成（只列清单，不做判断）
+{miss_text}
+
+⭐ 重点关注（按重要度排序）
 {focus_text}
 
 🎯 需关注 KR（未开始/进行中）
@@ -218,10 +273,43 @@ content = f"""【Workbuddy 自动生成 · 周度复盘 - {now.strftime('%Y-%m-%
 
 📝 你的动作
 1. 回顾上周「下周三件事」完成情况
-2. 处理真延期任务：要么拆解到可启动，要么改合理截止日
+2. 处理上方清单：要么拆解到可启动，要么改合理截止日
 3. 更新各 KR 信心指数
 4. 确定下周三件事（必须关联 KR）
 """
+
+
+CALL_MARK = "【Workbuddy 自动生成 · 周度复盘 - "
+
+
+def archive_old_callouts(keep=4):
+    """保留最近 keep 组「Workbuddy 自动生成」callout，归档更早的，避免回顾纠偏页面无限变长。
+    每组 = 1 个带日期标题的 callout + 其后续的续接块（长文本被切分产生）。"""
+    blocks = page_children(PAGE_ID)
+    groups, cur = [], None
+    for b in blocks:
+        if b.get("type") != "callout":
+            cur = None
+            continue
+        s = block_text(b)
+        if s.startswith(CALL_MARK):
+            cur = {"ids": [b["id"]]}
+            groups.append(cur)
+        elif cur is not None:
+            cur["ids"].append(b["id"])  # 续接块，跟随上一组一起归档
+    if len(groups) <= keep:
+        return 0
+    n = 0
+    for gp in groups[:-keep]:
+        for bid in gp["ids"]:
+            try:
+                r = requests.delete(f"https://api.notion.com/v1/blocks/{bid}", headers=H, timeout=15)
+                if r.status_code == 200:
+                    n += 1
+            except Exception:
+                pass
+    print(f"历史复盘归档: 保留最近 {keep} 组，已归档 {n} 块")
+    return n
 
 
 def write_to_page(text):
@@ -231,6 +319,8 @@ def write_to_page(text):
                        headers=H, json={"children": children}, timeout=20)
     print("写入回顾纠偏页面:", r.status_code,
           r.json().get("message", "") if r.status_code != 200 else f"OK({len(children)}块)")
+    if r.status_code == 200:
+        archive_old_callouts(keep=4)  # 只留最近 4 周，页面保持清爽
 
 
 def _text_to_callouts(text, icon, prefix=""):
@@ -249,13 +339,13 @@ def _text_to_callouts(text, icon, prefix=""):
         for i, c in enumerate(chunks)]
 
 
-def health_status(push_pct):
-    """推进型占比 → 健康度 select。"""
-    if push_pct < 30:
-        return "风险"
-    if push_pct < 50:
+def health_status(r):
+    """近 4 周兑现率 → 健康度 select（阈值与正文 health_note 保持一致）。"""
+    if r >= 85:
+        return "健康"
+    if r >= 70:
         return "警告"
-    return "健康"
+    return "风险"
 
 
 # ===== 关联项目：校验并剔除已删除的死链 =====
@@ -288,11 +378,12 @@ def build_summary_props():
     return {
         "周次": {"title": [{"text": {"content": week}}]},
         "复盘日期": {"date": {"start": today}},
-        "累计完成工作": {"number": total_done},
+        "近4周兑现率": {"number": r4},
+        "近4周完成数": {"number": len(w4_ok)},
+        "本周完成数": {"number": len(wk_ok)},
+        "活跃待办数": {"number": n_active},
         "推进型占比": {"number": push_pct},
-        "真延期数": {"number": n_overdue},
-        "本周到期数": {"number": n_due_week},
-        "健康度": {"select": {"name": health_status(push_pct)}},
+        "健康度": {"select": {"name": health_status(r4)}},
         "关联目标": {"rich_text": [{"text": {"content": GOAL_NAME}}]},
         "关联项目": {"relation": [{"id": pid} for pid in valid_project_ids(GOAL_PROJECTS)]},
     }
@@ -393,9 +484,10 @@ def sync_commitments():
 
 
 if __name__ == "__main__":
-    print(f"[工作领域] 周次:{week} | KR需关注:{len(kr_lines)} | 累计完成:{total_done} | "
-          f"推进型%:{push_pct} | 真延期:{n_overdue} | 本周到期:{n_due_week} | "
-          f"重点关注:{len(focus)} | 健康度:{health_status(push_pct)}")
+    print(f"[窗口口径] 周次:{week} | KR需关注:{len(kr_lines)} | 近4周:{len(w4_ok)}/{len(w4_tot)}"
+          f"={r4}%(前4周{r4_prev}%) | 本周:{len(wk_ok)}/{len(wk_tot)} | "
+          f"活跃待办:{n_active} | 推进型%:{push_pct} | 重点关注:{len(focus)} | "
+          f"健康度:{health_status(r4)}")
     print("=" * 50)
     print(content)
     print("=" * 50)
