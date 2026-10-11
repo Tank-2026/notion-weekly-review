@@ -223,11 +223,26 @@ n_active = len(active_todo)
 
 # 清单（只列事实与任务名，不做拖沓/延期判断，由本人看页面时自行评估）
 miss_sorted = sorted(w4_miss, key=lambda t: prank(t.get("properties", {})))[:8]
-focus = [t for t in work if g(t.get("properties", {}), "状态") not in (DONE_ST, DROP_ST)
-         and g(t.get("properties", {}), "重要")]
+# ⭐ 重点关注：只收「已排期 + 真正在推进」的重要任务
+#   三条硬门槛（缺一不可）：
+#     1) 状态 ∈ ACTIVE_ST（待办/日程/等待）——「将来也许/未整理」属停放区，近期未启动，不纳入
+#     2) 必须有「截止时间」——无截止日 = 尚未排期，不该出现在周度复盘的施压清单里
+#     3) 标注了「重要」
+#   说明：完成/废弃自然被 1) 排除，无需再单独判。
+def _in_focus(t):
+    p = t.get("properties", {})
+    return g(p, "状态") in ACTIVE_ST and bool(g(p, "截止时间")) and bool(g(p, "重要"))
+
+
+focus = [t for t in work if _in_focus(t)]
 focus_sorted = sorted(focus, key=lambda t: prank(t.get("properties", {})))[:12]
+# 被门槛挡掉的重要任务数量（仅用于日志核对，不写进正文）
+focus_skipped = sum(1 for t in work
+                    if g(t.get("properties", {}), "重要")
+                    and g(t.get("properties", {}), "状态") not in (DONE_ST, DROP_ST)
+                    and not _in_focus(t))
 miss_text = "\n".join(fmt_task(t) for t in miss_sorted) or "（无，近4周内到期任务均已完成）"
-focus_text = "\n".join(fmt_task(t) for t in focus_sorted) or "（暂无标注「重要」的任务）"
+focus_text = "\n".join(fmt_task(t) for t in focus_sorted) or "（暂无「已排期且在推进」的重要任务）"
 
 # 兑现率 → 一句诊断（阈值与 health_status 保持一致）
 if r4 >= 85:
@@ -265,7 +280,8 @@ content = f"""【Workbuddy 自动生成 · 周度复盘 - {now.strftime('%Y-%m-%
 📋 近 4 周内到期 · 尚未完成（只列清单，不做判断）
 {miss_text}
 
-⭐ 重点关注（按重要度排序）
+⭐ 重点关注（按重要度排序 · 只列已排期且在推进的重要任务）
+（已排除：无截止日期、停放区「将来也许/未整理」、已完成/废弃）
 {focus_text}
 
 🎯 需关注 KR（未开始/进行中）
@@ -483,7 +499,8 @@ def sync_commitments():
 if __name__ == "__main__":
     print(f"[窗口口径] 周次:{week} | KR需关注:{len(kr_lines)} | 近4周:{len(w4_ok)}/{len(w4_tot)}"
           f"={r4}%(前4周{r4_prev}%) | 本周:{len(wk_ok)}/{len(wk_tot)} | "
-          f"活跃待办:{n_active} | 推进型%:{push_pct} | 重点关注:{len(focus)} | "
+          f"活跃待办:{n_active} | 推进型%:{push_pct} | 重点关注:{len(focus)}"
+          f"(已排除未排期/停放 {focus_skipped}) | "
           f"健康度:{health_status(r4)}")
     print("=" * 50)
     print(content)
