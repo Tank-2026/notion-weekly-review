@@ -1,29 +1,27 @@
-import os, sys, requests, time
+import os, sys, re, requests, time
 from datetime import datetime, timedelta
 
 # ===== 从 GitHub Secrets 读取（本地测试用默认值） =====
 TOKEN = os.environ.get("NOTION_TOKEN", "ntn_U10348912549fc7XCmbmK2T8i6z41vEW2QsDYYcJG285tm")
 H = {"Authorization": f"Bearer {TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"}
+# 周复盘页面（新建，每周六写入；手写区不会被覆盖）
+WEEKLY_PAGE = os.environ.get("NOTION_WEEKLY_PAGE", "3f603daf-2ff6-818b-bd98-ded8571a48ec")
+# 回顾纠偏页面（已转为月度复盘，保留兼容）
 PAGE_ID = os.environ.get("NOTION_REVIEW_PAGE", "7445e6d5-15ca-4691-b34b-ca2db921909f")
 KR_DB = os.environ.get("NOTION_KR_DB", "e9056e7c-2110-4b09-badb-da80f2ec42ee")
 TASK_DB = os.environ.get("NOTION_TASK_DB", "31fa03dc-ff4a-47b1-8d27-ca3a749cb648")
-# 「复盘记录数据库」：每次复盘在此库写入/更新一行结构化记录（按「周次」upsert，避免重复）。
 SUMMARY_DB = os.environ.get("NOTION_SUMMARY_DB", "3a603daf-2ff6-81dc-ad40-e4e9ab85f938")
-# 该目标关联的项目（用于「关联项目」列）。写入前会校验，已删除的会自动剔除，不影响整行写入。
 GOAL_PROJECTS = [
-    "2c303daf-2ff6-808b-b81d-d6c39aa3afdb",  # 2025POA汇报幻灯（已删除，会被自动剔除）
     "28903daf-2ff6-8081-92e8-de2e64a36b29",  # 熟悉茁乐瑞普多
     "3c883c49-f267-4ab8-82e5-6fdcb6ff6ed4",  # 中青年覆盖
     "2b203daf-2ff6-809b-9ac1-e2a8689a72f6",  # 客情跟进
 ]
 GOAL_NAME = "2026年完成率120%"
-# 每周复盘页上两个承诺小节的标题（用于抓取文本入库）
-SEC_LAST = "回顾上周承诺"
-SEC_NEXT = "确定下周承诺"
 # 设 WRITE_TO_NOTION=1 才真正写入 Notion；本地测试默认只打印
 WRITE = os.environ.get("WRITE_TO_NOTION") == "1"
-# --sync：承诺回写模式（只更新承诺字段，不重新生成/覆盖指标）
 SYNC = "--sync" in sys.argv
+
+CALL_MARK = "【Workbuddy 自动生成 · 周复盘 - "
 
 
 def query(db_id, filter_body=None):
@@ -71,7 +69,6 @@ def g(p, k):
     return None
 
 
-# ===== 通用：读取页面块 / 抓取折叠小节文本 =====
 def page_children(bid):
     """读取某块的子块；带重试，失败返回空列表（不中断主流程）。"""
     url = f"https://api.notion.com/v1/blocks/{bid}/children?page_size=100"
@@ -86,7 +83,6 @@ def page_children(bid):
 
 
 def block_text(b):
-    """提取一个块的纯文本，覆盖页面上出现过的所有文本块类型。"""
     t = b.get("type")
     for k in ("paragraph", "heading_1", "heading_2", "heading_3", "callout", "toggle",
               "bulleted_list_item", "numbered_list_item", "to_do", "quote"):
@@ -95,89 +91,69 @@ def block_text(b):
     return ""
 
 
-def read_section(page_id, title):
-    """在页面中定位指定标题块（折叠小节），返回其子块文本拼接。
-    支持：paragraph（回顾上周承诺用它）与 numbered_list_item（确定下周承诺用它）。"""
-    for b in page_children(page_id):
-        t = b.get("type")
-        if t in ("heading_1", "heading_2", "heading_3", "toggle"):
-            name = "".join(x.get("plain_text", "") for x in b.get(t, {}).get("rich_text", []))
-            if title in name and b.get("has_children"):
-                lines = []
-                for c in page_children(b["id"]):
-                    s = block_text(c).strip()
-                    if s:
-                        lines.append(s)
-                    # 二级内容（toggle 内嵌套）
-                    if c.get("has_children") and c.get("type") in ("toggle", "bulleted_list_item", "numbered_list_item"):
-                        for c2 in page_children(c["id"]):
-                            s2 = block_text(c2).strip()
-                            if s2:
-                                lines.append("  - " + s2)
-                return "\n".join(lines)
-    return ""
-
-
 def trim(s, limit=1900):
-    """Notion 单条 rich_text 上限 2000 字，超限时截断并提示。"""
     s = (s or "").strip()
-    return s if len(s) <= limit else s[:limit] + "…（完整正文见本行页面内）"
+    return s if len(s) <= limit else s[:limit] + "…"
 
-
-# 「重要」优先级排序（数字越小越优先；未设置排最后）
-PRIORITY = {"战略顶级": 0, "重点关键": 1, "常规重要": 2, "临时任务": 3, "细微末节": 4}
 
 def tname(p):
     return g(p, "任务名称") or "(无标题)"
 
-def prank(p):
-    return PRIORITY.get(g(p, "重要"), 9)
 
 def fmt_task(t):
+    """任务名 + 关键执行信息（不含"重要"，该字段已弃用）。"""
     p = t.get("properties", {})
-    imp = g(p, "重要"); due = g(p, "截止时间")
-    tag = f"[{imp}] " if imp else ""
-    du = f" · 截止{due}" if due else ""
-    return f"• {tag}{tname(p)}{du}"
+    nm = tname(p)
+    due = g(p, "截止时间")
+    nat = g(p, "任务性质")
+    est = g(p, "预估时间")
+    bits = []
+    if nat:
+        bits.append(nat)
+    if est:
+        bits.append(f"{int(est)}min")
+    if due:
+        bits.append(f"截止{due}")
+    return f"• {nm}" + (f"　（{' · '.join(bits)}）" if bits else "")
 
 
+# ===== 时间基准 =====
 now = datetime.utcnow()
 today = now.strftime("%Y-%m-%d")
 y, w, _ = now.isocalendar()
-week = f"{y}-W{w:02d}"  # 例：2026-W30
+week = f"{y}-W{w:02d}"
 
-# 1. KR 状态
+# ===== 1. KR（状态指标：名称 + 信心指数） =====
 krs = query(KR_DB)
 kr_lines = []
+n_kr_active = 0
 for r in krs:
     p = r.get("properties", {})
-    name = g(p, "关键成果") or ""
+    nm = g(p, "关键成果") or ""
     st = g(p, "状态") or ""
-    conf = g(p, "信心指数") or ""
-    act = g(p, "下次推进动作") or ""
+    conf = g(p, "信心指数")
     if st in ("未开始", "进行中"):
-        kr_lines.append(f"• {name} | {st} | 信心:{conf} | 下一步:{act[:40]}")
+        n_kr_active += 1
+        conf_s = f"信心 {conf}/10" if conf is not None else "信心 —"
+        kr_lines.append(f"• {nm}\n　　{st} · {conf_s}")
+kr_text = "\n".join(kr_lines) or "（无进行中/未开始的 KR）"
 
-# ===== 2. 任务统计 —— 滚动窗口口径 =====
-# 口径（已确认）：
-#   分子 = 窗口内「截止时间」且 状态=完成 的任务数
-#   分母 = 窗口内「截止时间」且 状态≠废弃 的任务数（含未完成）
-#   依据：完成任务后会把「截止时间」改成完成当天，所以已完成任务的截止时间即完成日，
-#         可直接用来归周；未完成任务的截止时间仍是原计划截止日。
-#   副产物：拖期完成的任务会随截止时间一起挪到完成那周，因此历史周数字是滚动快照，
-#         会随补录而变化（已确认接受）。
+# ===== 2. 任务统计（滚动窗口口径，保留原逻辑） =====
 def is_work(p):
     dom = g(p, "领域")
     return dom in (None, "", "工作")
 
+
+DONE_ST, DROP_ST = "完成", "废弃"
+ACTIVE_ST = ("待办", "日程", "进行中", "等待")
+PARK_ST = ("将来也许", "未整理")
+
 tasks = query(TASK_DB)
 work = [t for t in tasks if is_work(t.get("properties", {}))]
 
-DONE_ST, DROP_ST = "完成", "废弃"
-ACTIVE_ST = ("待办", "日程", "等待")  # 真正欠账的状态；「将来也许/未整理」属停放区，不计
 
 def window(a, b):
-    """截止时间落在 [a,b] 的任务 → (分母, 已完成, 未完成)。「废弃」不计入分母。"""
+    """截止时间落在 [a,b] 的任务 → (全部, 已完成, 未完成)。「废弃」与停放区不计入分母。"""
     tot, ok, miss = [], [], []
     for t in work:
         p = t.get("properties", {})
@@ -185,17 +161,16 @@ def window(a, b):
         if not (due and a <= due <= b):
             continue
         st = g(p, "状态")
-        if st == DROP_ST:
+        if st in (DROP_ST,) or st in PARK_ST:
             continue
         tot.append(t)
         (ok if st == DONE_ST else miss).append(t)
     return tot, ok, miss
 
-# 本周（周一~周日，自然周）
+
 _mon = now - timedelta(days=now.weekday())
 this_a = _mon.strftime("%Y-%m-%d")
 this_b = (_mon + timedelta(days=6)).strftime("%Y-%m-%d")
-# 近 4 周（滚动 28 天，含今天）与前 4 周（趋势基线）
 w4_a = (now - timedelta(days=27)).strftime("%Y-%m-%d")
 w4_b = today
 p4_a = (now - timedelta(days=55)).strftime("%Y-%m-%d")
@@ -205,142 +180,221 @@ w4_tot, w4_ok, w4_miss = window(w4_a, w4_b)
 p4_tot, p4_ok, _ = window(p4_a, p4_b)
 wk_tot, wk_ok, _ = window(this_a, this_b)
 
+
 def rate(ok, tot):
     return round(len(ok) * 100 / len(tot)) if tot else 0
+
 
 r4 = rate(w4_ok, w4_tot)
 r4_prev = rate(p4_ok, p4_tot)
 delta = r4 - r4_prev
 
-# 推进型结构：近 4 周「已完成」中挂了项目的比例（不再用累计口径）
 push = sum(1 for t in w4_ok if g(t.get("properties", {}), "项目管理数据库"))
-maintain = len(w4_ok) - push
 push_pct = round(push * 100 / len(w4_ok)) if w4_ok else 0
+push_week = sum(1 for t in wk_ok if g(t.get("properties", {}), "项目管理数据库"))
 
-# 时点：活跃待办（排除已废弃与停放区，反映真实欠账）
-active_todo = [t for t in work if g(t.get("properties", {}), "状态") in ACTIVE_ST]
-n_active = len(active_todo)
+active = [t for t in work if g(t.get("properties", {}), "状态") in ACTIVE_ST]
+park = [t for t in work if g(t.get("properties", {}), "状态") in PARK_ST]
+n_active = len(active)
+n_park = len(park)
 
-# 清单（只列事实与任务名，不做拖沓/延期判断，由本人看页面时自行评估）
-miss_sorted = sorted(w4_miss, key=lambda t: prank(t.get("properties", {})))[:8]
-# ⭐ 重点关注：只收「已排期 + 真正在推进」的重要任务
-#   三条硬门槛（缺一不可）：
-#     1) 状态 ∈ ACTIVE_ST（待办/日程/等待）——「将来也许/未整理」属停放区，近期未启动，不纳入
-#     2) 必须有「截止时间」——无截止日 = 尚未排期，不该出现在周度复盘的施压清单里
-#     3) 标注了「重要」
-#   说明：完成/废弃自然被 1) 排除，无需再单独判。
-def _in_focus(t):
+# ===== 3. 上周三件 → 现在的推进位置（自动扫，不做评价） =====
+def _all_task_names():
+    m = {}
+    for t in work:
+        m[tname(t.get("properties", {}))] = t.get("properties", {})
+    return m
+
+
+TASK_MAP = _all_task_names()
+
+
+def locate(name):
+    """按任务名找当前状态，返回位置描述（只记位置，不判对错）。"""
+    p = TASK_MAP.get(name)
+    if not p:
+        return "（未匹配到任务）"
+    st = g(p, "状态") or "—"
+    if st == DONE_ST:
+        return "已完成 ✅"
+    if st in PARK_ST:
+        return f"停放（{st}）"
+    if st == DROP_ST:
+        return "已废弃"
+    return "推进中" if st in ("进行中", "日程") else f"未动（{st}）"
+
+
+def last_week_three():
+    """读最近一条非本周复盘的「本周三件」，逐条定位当前位置。"""
+    rows = query(SUMMARY_DB)
+    if not rows:
+        return [], ""
+    def d(r):
+        v = r.get("properties", {}).get("复盘日期", {}).get("date")
+        return (v or {}).get("start", "")
+    for r in sorted(rows, key=d, reverse=True):
+        p = r.get("properties", {})
+        if (g(p, "周次") or "") == week:
+            continue
+        raw = g(p, "本周三件") or ""
+        names = [re.sub(r"^[①②③④⑤⑥\d]+[\.、]?\s*", "", ln.strip()) for ln in raw.split("\n") if ln.strip()]
+        names = [n for n in names if n]
+        return names, raw
+    return [], ""
+
+
+last_names, _ = last_week_three()
+if last_names:
+    circ = "①②③④⑤⑥⑦⑧⑨"
+    last_three_text = "\n".join(
+        f"{circ[i] if i < len(circ) else '·'} {nm} → {locate(nm)}" for i, nm in enumerate(last_names)
+    )
+else:
+    last_three_text = "（首次运行，暂无上周三件记录）"
+
+week_done_names = [tname(t.get("properties", {}))[:28] for t in wk_ok][:8]
+week_done_text = "、".join(week_done_names) if week_done_names else "（本周暂无完成）"
+
+# ===== 4. 候选（带「下一步动作」，供本人自选 3 件） =====
+def cand_rank(t):
     p = t.get("properties", {})
-    return g(p, "状态") in ACTIVE_ST and bool(g(p, "截止时间")) and bool(g(p, "重要"))
+    p12 = g(p, "P1/P2")
+    pr = 0 if p12 == "P1" else (1 if p12 == "P2" else 3)
+    nat = 0 if g(p, "任务性质") == "推进型" else 1
+    return (pr, nat, g(p, "创建日期") or "9999")
 
 
-focus = [t for t in work if _in_focus(t)]
-focus_sorted = sorted(focus, key=lambda t: prank(t.get("properties", {})))[:12]
-# 被门槛挡掉的重要任务数量（仅用于日志核对，不写进正文）
-focus_skipped = sum(1 for t in work
-                    if g(t.get("properties", {}), "重要")
-                    and g(t.get("properties", {}), "状态") not in (DONE_ST, DROP_ST)
-                    and not _in_focus(t))
-miss_text = "\n".join(fmt_task(t) for t in miss_sorted) or "（无，近4周内到期任务均已完成）"
-focus_text = "\n".join(fmt_task(t) for t in focus_sorted) or "（暂无「已排期且在推进」的重要任务）"
+cand_pool = [t for t in active if g(t.get("properties", {}), "任务性质") == "推进型"
+             or g(t.get("properties", {}), "P1/P2") == "P1"]
+cand = sorted(cand_pool, key=cand_rank)[:6]
 
-# 兑现率 → 一句诊断（阈值与 health_status 保持一致）
-if r4 >= 85:
-    health_note = "✓ 兑现率健康，可考虑把下周承诺加码一件"
-elif r4 >= 70:
-    health_note = "⚠️ 兑现率偏低：先看下方清单，是估多了还是卡住了"
+cand_lines = []
+marks = "ABCDEF"
+for i, t in enumerate(cand):
+    p = t.get("properties", {})
+    nm = tname(p)
+    nxt = g(p, "下一步动作")
+    est = g(p, "预估时间")
+    scene = g(p, "任务场景")
+    meta = []
+    if est:
+        meta.append(f"{int(est)}min")
+    if scene and scene != "任意":
+        meta.append(scene)
+    meta_s = f"　[{(' · '.join(meta))}]" if meta else ""
+    if nxt:
+        cand_lines.append(f"{marks[i]}【{nm}】{meta_s}\n　　▸ {nxt}")
+    else:
+        cand_lines.append(f"{marks[i]}【{nm}】{meta_s}\n　　▸ ⚠️ 还没写「下一步动作」——请补一句，否则这一件无法启动")
+cand_text = "\n".join(cand_lines) or "（暂无推进型候选）"
+
+# ===== 5. 本周已选三件（P1）+ 防吃灰检查 =====
+this_three = [t for t in active if g(t.get("properties", {}), "P1/P2") == "P1"]
+three_lines = []
+missing_action = []
+for t in this_three:
+    p = t.get("properties", {})
+    nm = tname(p)
+    nxt = g(p, "下一步动作")
+    three_lines.append(f"• {nm}\n　　▸ {nxt}" if nxt else f"• {nm}\n　　▸ ⚠️ 缺「下一步动作」")
+    if not nxt:
+        missing_action.append(nm)
+if not three_lines:
+    this_three_text = "（还没有标记 P1 的任务 —— 从上面候选里圈 3 个，在任务库标为 P1）"
+elif len(this_three) > 3:
+    this_three_text = f"⚠️ 当前有 {len(this_three)} 个 P1，建议收敛到 3 个：\n" + "\n".join(three_lines)
 else:
-    health_note = "🚨 兑现率告急：近4周四成以上到期任务没落地，建议下周只承诺 2 件事"
+    this_three_text = "\n".join(three_lines)
 
-# 本周样本太小时不给百分比，避免 3/3 被读成"完美"
-if len(wk_tot) < 5:
-    week_note = f"- 样本仅 {len(wk_tot)} 件，不给百分比，只看方向"
-elif len(wk_tot) == len(wk_ok):
-    week_note = f"- 兑现率 {rate(wk_ok, wk_tot)}%（本周已全部落地）"
+n_action_filled = sum(1 for t in active if g(t.get("properties", {}), "下一步动作"))
+if missing_action:
+    missing_note = (f"\n⚠️ 防吃灰检查：本周三件里有 {len(missing_action)} 件没写「下一步动作」"
+                    f"（{('、'.join(missing_action))[:60]}）—— 补上才能启动")
+elif this_three:
+    missing_note = "\n✓ 本周三件都写了「下一步动作」"
 else:
-    week_note = f"- 兑现率 {rate(wk_ok, wk_tot)}%（周尚未结束，还会变化）"
+    missing_note = ""
 
+# ===== 6. 未来 4 周（P2） =====
+p2 = [t for t in active if g(t.get("properties", {}), "P1/P2") == "P2"]
+p2_text = "\n".join("• " + tname(t.get("properties", {}))[:40] for t in p2[:12]) or "（暂无 P2 任务）"
+
+# ===== 7. 我的处境 =====
+park_names = [tname(t.get("properties", {}))[:22] for t in park][:5]
+park_text = "、".join(park_names) if park_names else "（无）"
+
+health_note = ("✓ 兑现率健康" if r4 >= 85 else "⚠️ 兑现率偏低：先看清单，是估多了还是卡住了" if r4 >= 70
+               else "🚨 兑现率告急：下周只承诺 2 件")
 trend = ("↑" if delta > 0 else "↓" if delta < 0 else "—") + f" {abs(delta)}pt"
 
-content = f"""【Workbuddy 自动生成 · 周度复盘 - {now.strftime('%Y-%m-%d')}】
+# ===== 8. 正文（六板块） =====
+content = f"""{CALL_MARK}{now.strftime('%Y-%m-%d')}】
 
-🎯 近 4 周兑现率（主口径 · {w4_a} ~ {w4_b}）
-- 到期 {len(w4_tot)} 件 / 完成 {len(w4_ok)} 件 → {r4}%
-- 前 4 周 {r4_prev}% → {trend}
-- 推进型（挂项目）{push} 件，占完成量 {push_pct}%
-{health_note}
+① ✅ 上周我推进了什么
+【上周三件 · 现在在哪一步】（只记位置，不做评价）
+{last_three_text}
 
-📅 本周（{this_a} ~ {this_b}，截至今天，周未结束）
-- 到期 {len(wk_tot)} 件 / 完成 {len(wk_ok)} 件
-{week_note}
+本周完成 {len(wk_ok)} 件（其中推进型 {push_week} 件）
+{week_done_text}
 
-📌 当前活跃待办：{n_active} 件
-（只算 待办/日程/等待；已排除「废弃」与停放区「将来也许/未整理」）
+──────────────────
 
-📋 近 4 周内到期 · 尚未完成（只列清单，不做判断）
-{miss_text}
+② 🚀 本周推进三件
+【候选 · 每个已带"下一步动作"】（从中圈 3 个，在任务库里标为 P1）
+{cand_text}
 
-⭐ 重点关注（按重要度排序 · 只列已排期且在推进的重要任务）
-（已排除：无截止日期、停放区「将来也许/未整理」、已完成/废弃）
-{focus_text}
+【本周已选】（P1 任务）
+{this_three_text}{missing_note}
 
-🎯 需关注 KR（未开始/进行中）
-""" + "\n".join(kr_lines) + """
+──────────────────
 
-📝 你的动作
-1. 回顾上周「下周三件事」完成情况
-2. 处理上方清单：要么拆解到可启动，要么改合理截止日
-3. 更新各 KR 信心指数
-4. 确定下周三件事（必须关联 KR）
+③ 📊 状态指标（KR 信心指数）
+{kr_text}
+
+──────────────────
+
+④ 📅 未来 4 周（P2 任务）
+{p2_text}
+
+──────────────────
+
+⑤ 📦 我的处境
+活跃欠账 {n_active} 件 · 将来也许 {n_park} 件 · KR 进行中 {n_kr_active} 项
+将来也许 Top5（看一眼就行，本周不要求动）：{park_text}
+
+──────────────────
+
+📈 记分牌（参考，不是重点）
+近 4 周兑现率 {r4}%（前 4 周 {r4_prev}%，{trend}） · 推进型占比 {push_pct}% · {health_note}
 """
 
 
-CALL_MARK = "【Workbuddy 自动生成 · 周度复盘 - "
-
-
-def archive_old_callouts(keep=4):
-    """保留最近 keep 组「Workbuddy 自动生成」callout，归档更早的，避免回顾纠偏页面无限变长。
-    每组 = 1 个带日期标题的 callout + 其后续的续接块（长文本被切分产生）。"""
-    blocks = page_children(PAGE_ID)
-    groups, cur = [], None
-    for b in blocks:
-        if b.get("type") != "callout":
-            cur = None
-            continue
-        s = block_text(b)
-        if s.startswith(CALL_MARK):
-            cur = {"ids": [b["id"]]}
-            groups.append(cur)
-        elif cur is not None:
-            cur["ids"].append(b["id"])  # 续接块，跟随上一组一起归档
-    if len(groups) <= keep:
-        return 0
-    n = 0
-    for gp in groups[:-keep]:
-        for bid in gp["ids"]:
-            try:
-                r = requests.delete(f"https://api.notion.com/v1/blocks/{bid}", headers=H, timeout=15)
-                if r.status_code == 200:
-                    n += 1
-            except Exception:
-                pass
-    print(f"历史复盘归档: 保留最近 {keep} 组，已归档 {n} 块")
-    return n
-
-
-def write_to_page(text):
-    # Notion 单块富文本上限 2000 字，按行切分为多个 callout，保证整份复盘不丢内容
+def write_to_page(text, page=None):
+    """把自动区写入页面：先清理旧自动区，再插到锚点（说明 callout）之后，手写区不受影响。"""
+    page = page or WEEKLY_PAGE
+    anchor = None
+    for b in page_children(page):
+        if b.get("type") == "callout":
+            s = block_text(b)
+            if s.startswith(CALL_MARK):
+                try:
+                    requests.delete(f"https://api.notion.com/v1/blocks/{b['id']}", headers=H, timeout=15)
+                except Exception:
+                    pass
+            elif anchor is None and "Workbuddy" in s:
+                anchor = b["id"]
     children = _text_to_callouts(text, "🤖")
-    r = requests.patch(f"https://api.notion.com/v1/blocks/{PAGE_ID}/children",
-                       headers=H, json={"children": children}, timeout=20)
-    print("写入回顾纠偏页面:", r.status_code,
+    payload = {"children": children}
+    if anchor:
+        payload["after"] = anchor
+    r = requests.patch(f"https://api.notion.com/v1/blocks/{page}/children",
+                       headers=H, json=payload, timeout=20)
+    print("写入周复盘页面:", r.status_code,
           r.json().get("message", "") if r.status_code != 200 else f"OK({len(children)}块)")
-    if r.status_code == 200:
-        archive_old_callouts(keep=4)  # 只留最近 4 周，页面保持清爽
+    return r.status_code
 
 
 def _text_to_callouts(text, icon, prefix=""):
-    """把长文本按 1900 字切块，转成 callout 块列表。"""
     chunks, cur = [], ""
     for ln in text.split("\n"):
         if cur and len(cur) + len(ln) + 1 > 1900:
@@ -355,20 +409,11 @@ def _text_to_callouts(text, icon, prefix=""):
         for i, c in enumerate(chunks)]
 
 
-def health_status(r):
-    """近 4 周兑现率 → 健康度 select（阈值与正文 health_note 保持一致）。"""
-    if r >= 85:
-        return "健康"
-    if r >= 70:
-        return "警告"
-    return "风险"
-
-
-# ===== 关联项目：校验并剔除已删除的死链 =====
+# ===== 9. 复盘记录数据库（三件追踪） =====
 _PROJ_CACHE = {}
 
+
 def valid_project_ids(ids):
-    """过滤已删除/无权限的项目页，避免 relation 死链导致整行写入失败。"""
     ok = []
     for pid in ids:
         if pid in _PROJ_CACHE:
@@ -384,38 +429,37 @@ def valid_project_ids(ids):
         _PROJ_CACHE[pid] = good
         if good:
             ok.append(pid)
-        else:
-            print(f"  ⚠ 关联项目已失效，已剔除: {pid}")
     return ok
 
 
 def build_summary_props():
-    """构造「复盘记录数据库」一行所需的 properties（指标部分）。"""
+    """「复盘记录数据库」一行：指标 + 三件追踪。"""
+    circ = "①②③④⑤⑥⑦⑧⑨⑩"
+
+    def _c(i):
+        return circ[i] if i < len(circ) else f"{i+1}."
+
+    last_line = "\n".join(f"{_c(i)} {nm}" for i, nm in enumerate(last_names)) if last_names else ""
+    last_status = "\n".join(f"{_c(i)} {nm} → {locate(nm)}" for i, nm in enumerate(last_names)) if last_names else ""
+    this_line = "\n".join(f"{_c(i)} {tname(t.get('properties', {}))}" for i, t in enumerate(this_three)) if this_three else ""
     return {
         "周次": {"title": [{"text": {"content": week}}]},
         "复盘日期": {"date": {"start": today}},
-        "近4周兑现率": {"number": r4 / 100},  # percent 字段：值是 0~1（Notion 显示为百分比）
+        "近4周兑现率": {"number": r4 / 100},
         "近4周完成数": {"number": len(w4_ok)},
         "本周完成数": {"number": len(wk_ok)},
         "活跃待办数": {"number": n_active},
         "推进型占比": {"number": push_pct},
-        "健康度": {"select": {"name": health_status(r4)}},
         "关联目标": {"rich_text": [{"text": {"content": GOAL_NAME}}]},
         "关联项目": {"relation": [{"id": pid} for pid in valid_project_ids(GOAL_PROJECTS)]},
-    }
-
-
-def commit_props():
-    """从回顾纠偏页面抓取两个承诺小节的文本。"""
-    return {
-        "上周承诺回顾": {"rich_text": [{"text": {"content": trim(read_section(PAGE_ID, SEC_LAST))}}]},
-        "下周承诺三件事": {"rich_text": [{"text": {"content": trim(read_section(PAGE_ID, SEC_NEXT))}}]},
+        "上周三件": {"rich_text": [{"text": {"content": trim(last_line)}}]},
+        "上周三件推进情况": {"rich_text": [{"text": {"content": trim(last_status)}}]},
+        "本周三件": {"rich_text": [{"text": {"content": trim(this_line)}}]},
     }
 
 
 def write_row_body(page_id, text):
-    """把完整自动正文写进该行页面正文（不受 2000 字属性上限限制）。
-    幂等：先删除本行已有的自动正文块，再重新写入。"""
+    """把完整正文写进该行页面内（幂等：先删旧自动正文）。"""
     for b in page_children(page_id):
         if b.get("type") == "callout" and block_text(b).startswith("【Workbuddy 自动正文"):
             try:
@@ -430,7 +474,7 @@ def write_row_body(page_id, text):
 
 
 def _upsert(props):
-    """按「周次」upsert，返回 (response, row_page_id, was_update)。was_update=True 表示更新已有行，False 表示新建。"""
+    """按「周次」upsert，返回 (response, row_page_id, was_update)。"""
     existing = query(SUMMARY_DB, {"filter": {"property": "周次", "title": {"equals": week}}})
     if existing:
         pid = existing[0]["id"]
@@ -444,13 +488,9 @@ def _upsert(props):
 
 
 def write_summary_row():
-    """向「复盘记录数据库」写入/更新一行：指标 + 承诺 + 行内正文。
-    「自动复盘摘要」字段已删除（与页面正文重复），不在这里写入。"""
     props = build_summary_props()
-    props.update(commit_props())
     r, pid, was_update = _upsert(props)
     if r.status_code != 200:
-        # 关联关系异常时，去掉「关联项目」重试一次，保证这一行不会因为关联问题整行丢失
         print("  ⚠ 首次写入失败，去掉「关联项目」重试:", str(r.json().get("message", ""))[:120])
         props.pop("关联项目", None)
         r, pid, was_update = _upsert(props)
@@ -458,64 +498,21 @@ def write_summary_row():
     print(f"复盘记录数据库[{action} {week}]:", r.status_code,
           r.json().get("message", "") if r.status_code != 200 else f"OK({pid})")
     if r.status_code == 200 and pid:
-        write_row_body(pid, content)  # 完整正文写进页面（callout 块），便于留存与回溯
-    return r.status_code
-
-
-def find_latest_row():
-    """返回「复盘日期」最新的一行（用于周一回写承诺）。"""
-    rows = query(SUMMARY_DB)
-    if not rows:
-        return None
-    def d(r):
-        v = r.get("properties", {}).get("复盘日期", {}).get("date")
-        return (v or {}).get("start", "")
-    return sorted(rows, key=d, reverse=True)[0]
-
-
-def sync_commitments():
-    """--sync：把页面上现在写的两个承诺小节，回写到最近一条复盘记录。
-    只更新承诺字段，不覆盖周六生成的指标与摘要。"""
-    row = find_latest_row()
-    if not row:
-        print("未找到任何复盘记录，跳过回写")
-        return None
-    pid = row["id"]
-    wk = "".join(x.get("plain_text", "")
-                 for x in row.get("properties", {}).get("周次", {}).get("title", []))
-    props = commit_props()
-    r = requests.request("PATCH", f"https://api.notion.com/v1/pages/{pid}",
-                         headers=H, json={"properties": props}, timeout=20)
-    last = props["上周承诺回顾"]["rich_text"][0]["text"]["content"]
-    nxt = props["下周承诺三件事"]["rich_text"][0]["text"]["content"]
-    print(f"承诺回写[{wk}]:", r.status_code,
-          r.json().get("message", "") if r.status_code != 200 else "OK")
-    print(f"  上周承诺回顾: {len(last)} 字 | 下周承诺三件事: {len(nxt)} 字")
-    if not last and not nxt:
-        print("  ⚠ 两个小节都没读到内容，请检查页面上是否已填写、或小节标题是否变动")
+        write_row_body(pid, content)
     return r.status_code
 
 
 if __name__ == "__main__":
-    print(f"[窗口口径] 周次:{week} | KR需关注:{len(kr_lines)} | 近4周:{len(w4_ok)}/{len(w4_tot)}"
-          f"={r4}%(前4周{r4_prev}%) | 本周:{len(wk_ok)}/{len(wk_tot)} | "
-          f"活跃待办:{n_active} | 推进型%:{push_pct} | 重点关注:{len(focus)}"
-          f"(已排除未排期/停放 {focus_skipped}) | "
-          f"健康度:{health_status(r4)}")
+    print(f"[周复盘] 周次:{week} | KR进行中:{n_kr_active} | 近4周:{len(w4_ok)}/{len(w4_tot)}={r4}%"
+          f"(前4周{r4_prev}%) | 本周完成:{len(wk_ok)} | 活跃:{n_active} | 停放:{n_park} | "
+          f"候选:{len(cand)} | P1三件:{len(this_three)} | 已填下一步动作:{n_action_filled} | "
+          f"上周三件识别:{len(last_names)}")
     print("=" * 50)
     print(content)
     print("=" * 50)
-    if SYNC:
-        print("【承诺回写模式 --sync】")
-        if WRITE:
-            sync_commitments()
-        else:
-            print("【本地干跑，未写入 Notion】")
-            print("将回写:", commit_props())
-    elif WRITE:
+    if WRITE:
         write_to_page(content)
         write_summary_row()
     else:
         print("【本地干跑，未写入 Notion。GitHub Actions 运行时会自动写入】")
-        props = build_summary_props(); props.update(commit_props())
-        print("复盘记录数据库待写入行:", week, "|", props)
+        print("复盘记录数据库待写入行:", week)
