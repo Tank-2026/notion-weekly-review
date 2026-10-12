@@ -291,6 +291,81 @@ else:
 week_done_names = [tname(t.get("properties", {}))[:28] for t in wk_ok][:8]
 week_done_text = "、".join(week_done_names) if week_done_names else "（本周暂无完成）"
 
+
+# ===== 3.5 卡点：谁连续几周没动（零新增字段，从历史复盘记录推断） =====
+def _status_map(txt):
+    """把「上周三件推进情况」解析成 {任务名: 状态描述}。"""
+    out = {}
+    for ln in (txt or "").split("\n"):
+        ln = ln.strip()
+        if not ln or "→" not in ln:
+            continue
+        name, _, st = ln.partition("→")
+        name = re.sub(r"^[①②③④⑤⑥⑦⑧⑨⑩]+\s*", "", name)
+        name = re.sub(r"^\d+[\.、]\s*", "", name).strip()
+        if name:
+            out[name] = st.strip()
+    return out
+
+
+def stalled_tasks(min_weeks=2):
+    """数「连续几周都标未动」的任务（不需要任何新字段）。
+
+    数据源：「复盘记录数据库」历史行的「上周三件推进情况」——
+    每行记录的是"上一周的三件，在那一周结束时到哪一步"。
+    从最新一条往前连乘：某周出现"动了"或该任务没进三件 → 链条中断。
+    """
+    def _d(r):
+        v = r.get("properties", {}).get("复盘日期", {}).get("date")
+        return (v or {}).get("start", "")
+
+    streaks = {}
+    for r in sorted(query(SUMMARY_DB), key=_d, reverse=True):
+        st = _status_map(g(r.get("properties", {}), "上周三件推进情况"))
+        if not st:
+            continue
+        touched = set()
+        for nm, desc in st.items():
+            if "未动" in desc:
+                streaks[nm] = streaks.get(nm, 0) + 1
+                touched.add(nm)
+        for nm in list(streaks):
+            if nm not in touched:
+                del streaks[nm]        # 动了 / 没进三件 → 链条中断
+    return sorted([(n, c) for n, c in streaks.items() if c >= min_weeks],
+                  key=lambda x: -x[1])
+
+
+_stalled = stalled_tasks(2)
+if _stalled:
+    stall_text = "\n".join(f"• 《{n}》 —— 连续 {c} 周未推进" for n, c in _stalled[:8])
+else:
+    stall_text = "（暂无 —— 该统计从 2026-W41 开始积累，需几周后才有内容）"
+
+
+# ===== 3.6 「本期聚焦」：读同步块里上次写的那句（周六读到的即上周写的） =====
+def read_focus_from_page():
+    for b in page_children(WEEKLY_PAGE):
+        if b.get("type") != "synced_block":
+            continue
+        seen, buf = False, []
+        for k in page_children(b["id"]):
+            s = block_text(k).strip()
+            if k.get("type", "").startswith("heading") and "聚焦" in s:
+                seen = True
+                continue
+            if seen and s:
+                buf.append(s)
+        if seen:
+            txt = " ".join(buf).strip()
+            if txt.startswith("（一句话") or txt.startswith("(一句话"):
+                return ""            # 还是占位符 → 视为没填
+            return txt
+    return ""
+
+
+FOCUS_LAST = read_focus_from_page()
+
 # ===== 4. 候选（带「下一步动作」，供本人自选 3 件） =====
 def cand_rank(t):
     p = t.get("properties", {})
@@ -394,6 +469,9 @@ content = f"""{CALL_MARK}{now.strftime('%Y-%m-%d')}】
 
 本周完成 {len(wk_ok)} 件（其中推进型 {push_week} 件）
 {week_done_text}
+
+🕸 卡点（连续未推进 · 从历史复盘记录推断）
+{stall_text}
 
 ──────────────────
 
@@ -528,6 +606,8 @@ def build_summary_props():
         "关联项目": {"relation": [{"id": pid} for pid in valid_project_ids(GOAL_PROJECTS)]},
         "上周三件": {"rich_text": [{"text": {"content": trim(last_line)}}]},
         "上周三件推进情况": {"rich_text": [{"text": {"content": trim(last_status)}}]},
+        # 没填时写空数组（清空），避免空 content 触发写入失败
+        "上周聚焦": {"rich_text": ([{"text": {"content": trim(FOCUS_LAST)}}] if FOCUS_LAST else [])},
         "本周三件": {"rich_text": [{"text": {"content": trim(this_line)}}]},
     }
 
