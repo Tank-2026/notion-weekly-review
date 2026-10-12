@@ -269,7 +269,7 @@ def last_week_three():
         return (v or {}).get("start", "")
     for r in sorted(rows, key=d, reverse=True):
         p = r.get("properties", {})
-        if (g(p, "周次") or "") == week:
+        if (g(p, "复盘周期") or "") == week:
             continue
         raw = g(p, "本周三件") or ""
         names = [re.sub(r"^[①②③④⑤⑥⑦⑧⑨⑩]+\s*", "", ln.strip()) for ln in raw.split("\n") if ln.strip()]
@@ -594,7 +594,7 @@ def build_summary_props():
     last_status = "\n".join(f"{_c(i)} {nm} → {locate(nm)}" for i, nm in enumerate(last_names)) if last_names else ""
     this_line = "\n".join(f"{_c(i)} {tname(t.get('properties', {}))}" for i, t in enumerate(this_three)) if this_three else ""
     return {
-        "周次": {"title": [{"text": {"content": week}}]},
+        "复盘周期": {"title": [{"text": {"content": week}}]},
         "复盘日期": {"date": {"start": today}},
         "近4周兑现率": {"number": r4 / 100},
         "近4周完成数": {"number": len(w4_ok)},
@@ -631,8 +631,8 @@ def write_row_body(page_id, text):
 
 
 def _upsert(props):
-    """按「周次」upsert，返回 (response, row_page_id, was_update)。"""
-    existing = query(SUMMARY_DB, {"filter": {"property": "周次", "title": {"equals": week}}})
+    """按「复盘周期」upsert，返回 (response, row_page_id, was_update)。"""
+    existing = query(SUMMARY_DB, {"filter": {"property": "复盘周期", "title": {"equals": week}}})
     if existing:
         pid = existing[0]["id"]
         r = requests.request("PATCH", f"https://api.notion.com/v1/pages/{pid}",
@@ -685,7 +685,7 @@ def refresh_kr_snapshot():
 
 
 if __name__ == "__main__":
-    print(f"[周复盘] 周次:{week} | KR进行中:{n_kr_active} | 近4周:{len(w4_ok)}/{len(w4_tot)}={r4}%"
+    print(f"[周复盘] 周期:{week} | KR进行中:{n_kr_active} | 近4周:{len(w4_ok)}/{len(w4_tot)}={r4}%"
           f"(前4周{r4_prev}%) | 本周完成:{len(wk_ok)} | 活跃:{n_active} | 停放:{n_park} | "
           f"候选:{len(cand)} | P1三件:{len(this_three)} | 已填下一步动作:{n_action_filled} | "
           f"上周三件识别:{len(last_names)}")
@@ -695,7 +695,7 @@ if __name__ == "__main__":
     if WRITE:
         # 本周是否已有记录 —— 决定要不要刷新 KR 快照（见下）
         _week_row_exists = bool(query(SUMMARY_DB, {
-            "filter": {"property": "周次", "title": {"equals": week}}}))
+            "filter": {"property": "复盘周期", "title": {"equals": week}}}))
         write_to_page(content)
         write_summary_row()
         if _week_row_exists:
