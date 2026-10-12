@@ -237,7 +237,8 @@ def last_week_three():
         if (g(p, "周次") or "") == week:
             continue
         raw = g(p, "本周三件") or ""
-        names = [re.sub(r"^[①②③④⑤⑥\d]+[\.、]?\s*", "", ln.strip()) for ln in raw.split("\n") if ln.strip()]
+        names = [re.sub(r"^[①②③④⑤⑥⑦⑧⑨⑩]+\s*", "", ln.strip()) for ln in raw.split("\n") if ln.strip()]
+        names = [re.sub(r"^\d+[\.、]\s*", "", n) for n in names]
         names = [n for n in names if n]
         return names, raw
     return [], ""
@@ -320,9 +321,22 @@ elif this_three:
 else:
     missing_note = ""
 
-# ===== 6. 未来 4 周（P2） =====
-p2 = [t for t in active if g(t.get("properties", {}), "P1/P2") == "P2"]
-p2_text = "\n".join("• " + tname(t.get("properties", {}))[:40] for t in p2[:12]) or "（暂无 P2 任务）"
+# ===== 6. 未来 4 周（按截止时间自动筛，不依赖 P2 标记） =====
+# 说明：本周三件（P1）方向下的子任务不必再挂 P2，靠截止时间自然出现。
+fut_b = (now + timedelta(days=27)).strftime("%Y-%m-%d")
+
+
+def _due(t):
+    return g(t.get("properties", {}), "截止时间") or ""
+
+
+future = sorted([t for t in active if today <= _due(t) <= fut_b], key=_due)
+if future:
+    p2_text = "\n".join(f"• {tname(t.get('properties', {}))[:36]}　（{_due(t)}）" for t in future[:10])
+    if len(future) > 10:
+        p2_text += f"\n…（另有 {len(future) - 10} 件未列）"
+else:
+    p2_text = "（未来 4 周暂无到期任务）"
 
 # ===== 7. 我的处境 =====
 park_names = [tname(t.get("properties", {}))[:22] for t in park][:5]
@@ -358,7 +372,7 @@ content = f"""{CALL_MARK}{now.strftime('%Y-%m-%d')}】
 
 ──────────────────
 
-④ 📅 未来 4 周（P2 任务）
+④ 📅 未来 4 周（按截止时间自动筛）
 {p2_text}
 
 ──────────────────
@@ -378,16 +392,27 @@ def write_to_page(text, page=None):
     """把自动区写入页面：先清理旧自动区，再插到锚点（说明 callout）之后，手写区不受影响。"""
     page = page or WEEKLY_PAGE
     anchor = None
+    to_delete = []
+    in_auto = False
     for b in page_children(page):
-        if b.get("type") == "callout":
+        t = b.get("type")
+        if t == "callout":
             s = block_text(b)
             if s.startswith(CALL_MARK):
-                try:
-                    requests.delete(f"https://api.notion.com/v1/blocks/{b['id']}", headers=H, timeout=15)
-                except Exception:
-                    pass
-            elif anchor is None and "Workbuddy" in s:
-                anchor = b["id"]
+                in_auto = True          # 自动区开始
+            elif anchor is None and "Workbuddy" in s and not in_auto:
+                anchor = b["id"]        # 说明 callout（永不删）
+                continue
+        if in_auto:
+            if t == "callout":
+                to_delete.append(b["id"])   # 自动区所有块（含被切分的续接块）
+            else:
+                in_auto = False             # 遇到 divider 等 → 自动区结束
+    for bid in to_delete:
+        try:
+            requests.delete(f"https://api.notion.com/v1/blocks/{bid}", headers=H, timeout=15)
+        except Exception:
+            pass
     children = _text_to_callouts(text, "🤖")
     payload = {"children": children}
     if anchor:
