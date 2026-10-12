@@ -584,7 +584,9 @@ def write_summary_row():
 def refresh_kr_snapshot():
     """把「信心指数」当前值存进「信心指数(上周)」，并把「下次检查日期」刷新为下次复盘日。
 
-    必须在**报告写完之后**调用 —— 因为报告要用「上周」里的旧值做对比，
+    两条纪律（否则「上周值」会被自己覆盖，对比永远为 0）：
+      1. 必须在**报告写完之后**调用 —— 报告要用「上周」里的旧值做对比；
+      2. 只在**本周第一次运行**时刷新 —— 一周内重复运行会跳过。
     刷新后，本次的"当前信心"就成为下周的"上周信心"。
     """
     if not kr_snapshot:
@@ -613,9 +615,15 @@ if __name__ == "__main__":
     print(content)
     print("=" * 50)
     if WRITE:
+        # 本周是否已有记录 —— 决定要不要刷新 KR 快照（见下）
+        _week_row_exists = bool(query(SUMMARY_DB, {
+            "filter": {"property": "周次", "title": {"equals": week}}}))
         write_to_page(content)
         write_summary_row()
-        refresh_kr_snapshot()
+        if _week_row_exists:
+            print(f"KR 信心快照：本周（{week}）已刷新过，跳过 —— 避免把本周值误当上周值")
+        else:
+            refresh_kr_snapshot()
     else:
         print("【本地干跑，未写入 Notion。GitHub Actions 运行时会自动写入】")
         print("复盘记录数据库待写入行:", week)
