@@ -321,22 +321,26 @@ elif this_three:
 else:
     missing_note = ""
 
-# ===== 6. 未来 4 周（按截止时间自动筛，不依赖 P2 标记） =====
-# 说明：本周三件（P1）方向下的子任务不必再挂 P2，靠截止时间自然出现。
-fut_b = (now + timedelta(days=27)).strftime("%Y-%m-%d")
+# ===== 6. 未来 4 周（P2 标记） =====
+# P1/P2 字段设定源自《OKR工作法》周报：
+#   P1 = 接下来一周的三件重要任务   P2 = 未来四周应该办的重要任务
+# 与「2026年完成率120%」页面的视图保持同源（该视图 quick_filters：推进型 + P1/P2=P2 + 状态待办/进行中）
 
 
 def _due(t):
     return g(t.get("properties", {}), "截止时间") or ""
 
 
-future = sorted([t for t in active if today <= _due(t) <= fut_b], key=_due)
+future = sorted([t for t in active
+                 if g(t.get("properties", {}), "P1/P2") == "P2"
+                 and g(t.get("properties", {}), "任务性质") == "推进型"],
+                key=lambda t: (_due(t) or "9999"))
 if future:
-    p2_text = "\n".join(f"• {tname(t.get('properties', {}))[:36]}　（{_due(t)}）" for t in future[:10])
+    p2_text = "\n".join(f"• {tname(t.get('properties', {}))[:36]}" for t in future[:10])
     if len(future) > 10:
         p2_text += f"\n…（另有 {len(future) - 10} 件未列）"
 else:
-    p2_text = "（未来 4 周暂无到期任务）"
+    p2_text = "（暂无 P2 标记的任务 —— 在任务库里把「未来 4 周要办」的推进型任务标为 P2）"
 
 # ===== 7. 我的处境 =====
 park_names = [tname(t.get("properties", {}))[:22] for t in park][:5]
@@ -372,7 +376,7 @@ content = f"""{CALL_MARK}{now.strftime('%Y-%m-%d')}】
 
 ──────────────────
 
-④ 📅 未来 4 周（按截止时间自动筛）
+④ 📅 未来 4 周（P2 标记 · 未来四周要办的重要任务）
 {p2_text}
 
 ──────────────────
@@ -389,30 +393,35 @@ content = f"""{CALL_MARK}{now.strftime('%Y-%m-%d')}】
 
 
 def write_to_page(text, page=None):
-    """把自动区写入页面：先清理旧自动区，再插到锚点（说明 callout）之后，手写区不受影响。"""
+    """把自动区写入页面。
+
+    结构约定：[说明 callout] [自动区（若干 callout）] [divider] [手写区…]
+    清理规则：删掉「说明 callout」之后、第一个 divider 之前的**所有**块。
+    这样无论自动区被切成几块、之前是否残留过重复块，都能一次清干净；手写区永不受影响。
+    """
     page = page or WEEKLY_PAGE
-    anchor = None
+    blocks = page_children(page)
+    anchor, anchor_i = None, None
+    for i, b in enumerate(blocks):
+        if b.get("type") != "callout":
+            continue
+        s = block_text(b)
+        if "Workbuddy" in s and not s.startswith(CALL_MARK):
+            anchor, anchor_i = b["id"], i     # 说明 callout（永不删）
+            break
     to_delete = []
-    in_auto = False
-    for b in page_children(page):
-        t = b.get("type")
-        if t == "callout":
-            s = block_text(b)
-            if s.startswith(CALL_MARK):
-                in_auto = True          # 自动区开始
-            elif anchor is None and "Workbuddy" in s and not in_auto:
-                anchor = b["id"]        # 说明 callout（永不删）
-                continue
-        if in_auto:
-            if t == "callout":
-                to_delete.append(b["id"])   # 自动区所有块（含被切分的续接块）
-            else:
-                in_auto = False             # 遇到 divider 等 → 自动区结束
+    if anchor_i is not None:
+        for b in blocks[anchor_i + 1:]:
+            if b.get("type") == "divider":
+                break                          # divider 之后是手写区，停
+            to_delete.append(b["id"])
     for bid in to_delete:
         try:
             requests.delete(f"https://api.notion.com/v1/blocks/{bid}", headers=H, timeout=15)
         except Exception:
             pass
+    if to_delete:
+        time.sleep(0.5)                        # 等删除生效，避免与插入竞态产生重复块
     children = _text_to_callouts(text, "🤖")
     payload = {"children": children}
     if anchor:
@@ -489,13 +498,18 @@ def build_summary_props():
 
 
 def write_row_body(page_id, text):
-    """把完整正文写进该行页面内（幂等：先删旧自动正文）。"""
-    for b in page_children(page_id):
-        if b.get("type") == "callout" and block_text(b).startswith("【Workbuddy 自动正文"):
-            try:
-                requests.delete(f"https://api.notion.com/v1/blocks/{b['id']}", headers=H, timeout=15)
-            except Exception:
-                pass
+    """把完整正文写进该行页面内（幂等：先清空该行页面所有块，再写入）。
+
+    行页面是本脚本独占的，全清再写可避免历史残留造成重复。
+    """
+    blocks = page_children(page_id)
+    for b in blocks:
+        try:
+            requests.delete(f"https://api.notion.com/v1/blocks/{b['id']}", headers=H, timeout=15)
+        except Exception:
+            pass
+    if blocks:
+        time.sleep(0.5)
     children = _text_to_callouts(text, "📄", prefix=f"【Workbuddy 自动正文 · {week}】\n\n")
     r = requests.patch(f"https://api.notion.com/v1/blocks/{page_id}/children",
                        headers=H, json={"children": children}, timeout=20)
