@@ -591,7 +591,6 @@ def build_summary_props():
     def _c(i):
         return circ[i] if i < len(circ) else f"{i+1}."
 
-    last_line = "\n".join(f"{_c(i)} {nm}" for i, nm in enumerate(last_names)) if last_names else ""
     last_status = "\n".join(f"{_c(i)} {nm} → {locate(nm)}" for i, nm in enumerate(last_names)) if last_names else ""
     this_line = "\n".join(f"{_c(i)} {tname(t.get('properties', {}))}" for i, t in enumerate(this_three)) if this_three else ""
     return {
@@ -604,7 +603,6 @@ def build_summary_props():
         "推进型占比": {"number": push_pct},
         "关联目标": {"rich_text": [{"text": {"content": GOAL_NAME}}]},
         "关联项目": {"relation": [{"id": pid} for pid in valid_project_ids(GOAL_PROJECTS)]},
-        "上周三件": {"rich_text": [{"text": {"content": trim(last_line)}}]},
         "上周三件推进情况": {"rich_text": [{"text": {"content": trim(last_status)}}]},
         # 没填时写空数组（清空），避免空 content 触发写入失败
         "上周聚焦": {"rich_text": ([{"text": {"content": trim(FOCUS_LAST)}}] if FOCUS_LAST else [])},
