@@ -264,8 +264,7 @@ def cand_rank(t):
     return (pr, nat, g(p, "创建日期") or "9999")
 
 
-cand_pool = [t for t in active if g(t.get("properties", {}), "任务性质") == "推进型"
-             or g(t.get("properties", {}), "P1/P2") == "P1"]
+cand_pool = [t for t in active if g(t.get("properties", {}), "任务性质") == "推进型"]
 cand = sorted(cand_pool, key=cand_rank)[:6]
 
 cand_lines = []
@@ -296,9 +295,15 @@ for t in this_three:
     p = t.get("properties", {})
     nm = tname(p)
     nxt = g(p, "下一步动作")
-    three_lines.append(f"• {nm}\n　　▸ {nxt}" if nxt else f"• {nm}\n　　▸ ⚠️ 缺「下一步动作」")
-    if not nxt:
+    is_push = g(p, "任务性质") == "推进型"
+    if nxt:
+        three_lines.append(f"• {nm}\n　　▸ {nxt}")
+    elif is_push:
+        three_lines.append(f"• {nm}\n　　▸ ⚠️ 缺「下一步动作」—— 补一句")
         missing_action.append(nm)
+    else:
+        # 维护型/琐碎事不必写动作，它们靠截止时间管理
+        three_lines.append(f"• {nm}　（{g(p, '任务性质') or '非推进型'}，靠截止时间管，不必写动作）")
 if not three_lines:
     this_three_text = "（还没有标记 P1 的任务 —— 从上面候选里圈 3 个，在任务库标为 P1）"
 elif len(this_three) > 3:
