@@ -116,11 +116,26 @@ def fmt_task(t):
     return f"• {nm}" + (f"　（{' · '.join(bits)}）" if bits else "")
 
 
-# ===== 时间基准 =====
-now = datetime.utcnow()
+# ===== 时间基准（统一用北京时间） =====
+CN_OFFSET = timedelta(hours=8)
+now = datetime.utcnow() + CN_OFFSET
 today = now.strftime("%Y-%m-%d")
 y, w, _ = now.isocalendar()
 week = f"{y}-W{w:02d}"
+MONTH_EN = ["January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December"]
+month_label = f"{now.year}-{MONTH_EN[now.month - 1]}"     # 月度记录命名：2026-October
+
+# ===== 今天该跑什么（单一定时 + 脚本判断，从根上避免周/月复盘并发） =====
+# MANUAL=true（workflow_dispatch 手动触发）→ 强制跑周复盘，方便随时补跑/调试
+MANUAL = os.environ.get("MANUAL") == "true"
+RUN_WEEKLY = True if MANUAL else (now.weekday() == 5)      # 周六
+RUN_MONTHLY = False if MANUAL else (now.day == 1)          # 每月 1 号
+if not (RUN_WEEKLY or RUN_MONTHLY):
+    print(f"[跳过] 北京时间 {now:%Y-%m-%d %H:%M} —— 既非周六、也非 1 号，今天没有复盘任务")
+    raise SystemExit(0)
+print(f"[模式] 北京 {now:%Y-%m-%d %H:%M} | 周复盘:{'跑' if RUN_WEEKLY else '—'}"
+      f" | 月度复盘:{'跑' if RUN_MONTHLY else '—'}")
 
 # ===== 1. KR（状态指标：信心指数 + 与上周的变化） =====
 # 只列「需要关注」的（信心 ≤ CONF_FOCUS 或未评），避免 13 条摊平、稀释焦点。
@@ -685,23 +700,30 @@ def refresh_kr_snapshot():
 
 
 if __name__ == "__main__":
-    print(f"[周复盘] 周期:{week} | KR进行中:{n_kr_active} | 近4周:{len(w4_ok)}/{len(w4_tot)}={r4}%"
-          f"(前4周{r4_prev}%) | 本周完成:{len(wk_ok)} | 活跃:{n_active} | 停放:{n_park} | "
-          f"候选:{len(cand)} | P1三件:{len(this_three)} | 已填下一步动作:{n_action_filled} | "
-          f"上周三件识别:{len(last_names)}")
-    print("=" * 50)
-    print(content)
-    print("=" * 50)
-    if WRITE:
-        # 本周是否已有记录 —— 决定要不要刷新 KR 快照（见下）
-        _week_row_exists = bool(query(SUMMARY_DB, {
-            "filter": {"property": "复盘周期", "title": {"equals": week}}}))
-        write_to_page(content)
-        write_summary_row()
-        if _week_row_exists:
-            print(f"KR 信心快照：本周（{week}）已刷新过，跳过 —— 避免把本周值误当上周值")
+    if RUN_WEEKLY:
+        print(f"[周复盘] 周期:{week} | KR进行中:{n_kr_active} | 近4周:{len(w4_ok)}/{len(w4_tot)}={r4}%"
+              f"(前4周{r4_prev}%) | 本周完成:{len(wk_ok)} | 活跃:{n_active} | 停放:{n_park} | "
+              f"候选:{len(cand)} | P1三件:{len(this_three)} | 已填下一步动作:{n_action_filled} | "
+              f"上周三件识别:{len(last_names)}")
+        print("=" * 50)
+        print(content)
+        print("=" * 50)
+        if WRITE:
+            # 本周是否已有记录 —— 决定要不要刷新 KR 快照（见下）
+            _week_row_exists = bool(query(SUMMARY_DB, {
+                "filter": {"property": "复盘周期", "title": {"equals": week}}}))
+            write_to_page(content)
+            write_summary_row()
+            if _week_row_exists:
+                print(f"KR 信心快照：本周（{week}）已刷新过，跳过 —— 避免把本周值误当上周值")
+            else:
+                refresh_kr_snapshot()
         else:
-            refresh_kr_snapshot()
-    else:
-        print("【本地干跑，未写入 Notion。GitHub Actions 运行时会自动写入】")
-        print("复盘记录数据库待写入行:", week)
+            print("【本地干跑，未写入 Notion。GitHub Actions 运行时会自动写入】")
+            print("复盘记录数据库待写入行:", week)
+
+    if RUN_MONTHLY:
+        # ===== 月度复盘（模板待设计，A1 已搁置）=====
+        # 命名规范已定：记录名 = month_label（如 2026-October），与周复盘 2026-W43 同库共存。
+        # 模板确定后在此接入：读「回顾纠偏」页面 + 写「复盘记录数据库」月度行。
+        print(f"[月度复盘] 周期:{month_label} —— 模板尚未实现，本次不写入任何内容")
