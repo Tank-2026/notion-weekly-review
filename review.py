@@ -1,4 +1,4 @@
-import os, sys, re, requests, time
+import os, re, requests, time
 from datetime import datetime, timedelta
 
 # ===== 从 GitHub Secrets 读取（本地测试用默认值） =====
@@ -19,7 +19,6 @@ GOAL_PROJECTS = [
 GOAL_NAME = "2026年完成率120%"
 # 设 WRITE_TO_NOTION=1 才真正写入 Notion；本地测试默认只打印
 WRITE = os.environ.get("WRITE_TO_NOTION") == "1"
-SYNC = "--sync" in sys.argv
 
 CALL_MARK = "【Workbuddy 自动生成 · 周复盘 - "
 
@@ -123,20 +122,56 @@ today = now.strftime("%Y-%m-%d")
 y, w, _ = now.isocalendar()
 week = f"{y}-W{w:02d}"
 
-# ===== 1. KR（状态指标：名称 + 信心指数） =====
+# ===== 1. KR（状态指标：信心指数 + 与上周的变化） =====
+# 只列「需要关注」的（信心 ≤ CONF_FOCUS 或未评），避免 13 条摊平、稀释焦点。
+# 汇报用「信心指数(上周)」里存的上次值做对比；汇报结束后再把当前值刷新进去（见 refresh_kr_snapshot）。
+CONF_FOCUS = 5
 krs = query(KR_DB)
-kr_lines = []
 n_kr_active = 0
-for r in krs:
-    p = r.get("properties", {})
-    nm = g(p, "关键成果") or ""
-    st = g(p, "状态") or ""
-    conf = g(p, "信心指数")
-    if st in ("未开始", "进行中"):
-        n_kr_active += 1
-        conf_s = f"信心 {conf}/10" if conf is not None else "信心 —"
-        kr_lines.append(f"• {nm}\n　　{st} · {conf_s}")
+kr_all = []            # (name, status, conf, conf_prev)
+kr_snapshot = []       # (page_id, conf) —— 待刷新的 KR
+
+
+def _num(v):
+    if v is None:
+        return "—"
+    f = float(v)
+    return str(int(f)) if f == int(f) else str(round(f, 2))
+
+
+for _r in krs:
+    _p = _r.get("properties", {})
+    _st = g(_p, "状态") or ""
+    if _st not in ("未开始", "进行中"):
+        continue
+    n_kr_active += 1
+    _conf = g(_p, "信心指数")
+    _prev = g(_p, "信心指数(上周)")
+    kr_all.append((g(_p, "关键成果") or "", _st, _conf, _prev))
+    kr_snapshot.append((_r["id"], _conf))
+
+kr_focus = [k for k in kr_all if k[2] is None or k[2] <= CONF_FOCUS]
+kr_focus.sort(key=lambda k: (0 if k[2] is None else 1, k[2] if k[2] is not None else 0))
+
+kr_lines = []
+for nm, st, conf, prev in kr_focus:
+    if conf is None:
+        mark = "⚠️ 未评信心"
+    elif prev is None:
+        mark = f"信心 {_num(conf)}/10（首次记录）"
+    else:
+        d = round(conf - prev, 2)
+        arrow = "↑" if d > 0 else "↓" if d < 0 else "→"
+        mark = f"信心 {_num(conf)}/10（上周 {_num(prev)}，{arrow}{_num(abs(d))}）"
+    kr_lines.append(f"• {nm}\n　　{st} · {mark}")
+_kr_more = len(kr_all) - len(kr_focus)
+if _kr_more > 0:
+    kr_lines.append(f"…（另有 {_kr_more} 条信心 >{CONF_FOCUS}，月度复盘时看）")
 kr_text = "\n".join(kr_lines) or "（无进行中/未开始的 KR）"
+
+# 下次复盘日 = 下一个周六
+_days_ahead = (5 - now.weekday()) % 7 or 7
+NEXT_REVIEW = (now + timedelta(days=_days_ahead)).strftime("%Y-%m-%d")
 
 # ===== 2. 任务统计（滚动窗口口径，保留原逻辑） =====
 def is_work(p):
@@ -371,7 +406,7 @@ content = f"""{CALL_MARK}{now.strftime('%Y-%m-%d')}】
 
 ──────────────────
 
-③ 📊 状态指标（KR 信心指数）
+③ 📊 状态指标（只列需关注的 KR · 含与上周对比）
 {kr_text}
 
 ──────────────────
@@ -546,6 +581,29 @@ def write_summary_row():
     return r.status_code
 
 
+def refresh_kr_snapshot():
+    """把「信心指数」当前值存进「信心指数(上周)」，并把「下次检查日期」刷新为下次复盘日。
+
+    必须在**报告写完之后**调用 —— 因为报告要用「上周」里的旧值做对比，
+    刷新后，本次的"当前信心"就成为下周的"上周信心"。
+    """
+    if not kr_snapshot:
+        return
+    ok = 0
+    for rid, conf in kr_snapshot:
+        props = {"下次检查日期": {"date": {"start": NEXT_REVIEW}}}
+        if conf is not None:
+            props["信心指数(上周)"] = {"number": conf}
+        try:
+            r = requests.patch(f"https://api.notion.com/v1/pages/{rid}", headers=H,
+                               json={"properties": props}, timeout=20)
+            if r.status_code == 200:
+                ok += 1
+        except Exception:
+            pass
+    print(f"KR 信心快照刷新: {ok}/{len(kr_snapshot)} | 下次检查日期 → {NEXT_REVIEW}")
+
+
 if __name__ == "__main__":
     print(f"[周复盘] 周次:{week} | KR进行中:{n_kr_active} | 近4周:{len(w4_ok)}/{len(w4_tot)}={r4}%"
           f"(前4周{r4_prev}%) | 本周完成:{len(wk_ok)} | 活跃:{n_active} | 停放:{n_park} | "
@@ -557,6 +615,7 @@ if __name__ == "__main__":
     if WRITE:
         write_to_page(content)
         write_summary_row()
+        refresh_kr_snapshot()
     else:
         print("【本地干跑，未写入 Notion。GitHub Actions 运行时会自动写入】")
         print("复盘记录数据库待写入行:", week)
